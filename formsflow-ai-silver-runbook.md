@@ -19,7 +19,7 @@
 - Porting the custom Camunda Java extensions (Keycloak service-account token class, Redis-backed real-time task-event websocket push, `ApplicationAccessHandler`) currently in the v4.0.8 `forms-flow-bpm` overlay, **unless** the "Camunda/API may need customizations" question above resolves to include this — TBD, don't assume either way yet. Absent that, this install uses vanilla EE `forms-flow-bpm` — real-time task-list updates will not work; users see stock poll/refresh behavior until a follow-up project ports that code forward.
 - Porting the custom `ServiceFlow` React UI (task list/filters) built against the old monolithic `forms-flow-web` — incompatible with the microfrontend architecture. Concrete, possibly citizen-facing gap: the `REACT_APP_PUBLIC_FORM_ID`/`DOCUMENT_TYPES`-driven public NCQ document-serving flow has no equivalent in the stock web chart. **Confirm with the team before a prod cutover** whether this needs to be resolved first.
 - `forms-flow-mcp` — skipped this pass; add later if needed.
-- ~~`forms-flow-data-layer`, `forms-flow-documents-api`, `forms-flow-analytics`~~ — **now in scope** as of the 2026-08-17 EE pivot (see Phase 3 additions below). `forms-flow-data-analysis-api` remains out of scope (not requested).
+- ~~`forms-flow-documents-api`, `forms-flow-analytics`~~ — **now in scope** as of the 2026-08-17 EE pivot (see Phase 3 additions below). `forms-flow-data-analysis-api` remains out of scope (not requested). `forms-flow-data-layer` was also brought into scope on 2026-08-17 but **skipped on investigation 2026-08-18** — see Phase 3.6: it's infrastructure for external GraphQL consumers, and nothing in this stack (or ServeLegal's own code) actually consumes it.
 
 ---
 
@@ -320,7 +320,7 @@ helm repo update
 
 ## Phase 3 — Ordered `helm upgrade --install`
 
-Deployment order (dependency-correct, matches the chart repo's own documented order and the validated `deploy-stack.sh`, extended with the 2026-08-17 EE scope additions): `forms-flow-ai` (infra shell) → `forms-flow-servebc-config` → `forms-flow-idm` (Keycloak) → `forms-flow-forms` (Form.io) → `forms-flow-api` (webapi) → `forms-flow-data-layer` → `forms-flow-documents-api` → `forms-flow-analytics` → `forms-flow-bpm` (Camunda) → `servebc-api` (custom API) → `forms-flow-web`. The three new components all land right after `forms-flow-api` since each depends on api/forms/idm already being up (data-layer and documents-api directly reference their secrets/config; analytics is more loosely coupled but keeping the order consistent costs nothing).
+Deployment order (dependency-correct, matches the chart repo's own documented order and the validated `deploy-stack.sh`, extended with the 2026-08-17 EE scope additions): `forms-flow-ai` (infra shell) → `forms-flow-servebc-config` → `forms-flow-idm` (Keycloak) → `forms-flow-forms` (Form.io) → `forms-flow-api` (webapi) → ~~`forms-flow-data-layer`~~ (**skipped 2026-08-18, see 3.6 — unused, no consumer found anywhere in this stack**) → `forms-flow-documents-api` → `forms-flow-analytics` → `forms-flow-bpm` (Camunda) → `servebc-api` (custom API) → `forms-flow-web`. The remaining new components land right after `forms-flow-api` since each depends on api/forms/idm already being up (documents-api directly references their secrets/config; analytics is more loosely coupled but keeping the order consistent costs nothing).
 
 **Decision, confirmed with the user: Postgres via existing Patroni, not the chart's bundled Bitnami `postgresql-ha`.** Bitnami's `postgresql-ha`/`mongodb` images moved to the frozen/unpatched `bitnamilegacy` catalog (Aug 2025) — a real "blocks prod sign-off" problem the original draft of this runbook flagged. Patroni is already running, already BC-Gov-approved in this namespace, and architecturally simpler (DCS-based leader election, no separate pgpool routing tier) than repmgr+pgpool — reusing it sidesteps the Bitnami problem entirely rather than trading one HA technology for an equivalently-good one with a licensing/staleness catch. Mongo: no existing HA alternative, so reuse the existing single-instance `formio-mongodb-dev` rather than adding a second frozen-image dependency (the current v4.0.8 stack already runs this way with no reported issues).
 
@@ -658,10 +658,19 @@ helm upgrade --install forms-flow-api ./charts/forms-flow-api \
 
 **Confirmed working live 2026-08-18** — pod `2/2 Running`, no restarts, `curl -sk https://forms-flow-api-${NS}.${DOMAIN}/webapi/` → `HTTP 200`, clean gunicorn boot with no Keycloak/Form.io connection errors (both were broken by the Phase 3.1 bugs above until those were fixed and this pod was restarted to pick up the corrected shared config).
 
-### 3.6 forms-flow-data-layer (EE scope addition — no new database, reuses forms-flow-api's secret)
+### 3.6 forms-flow-data-layer — SKIPPED for this pass (2026-08-18)
 
-Needs `forms-flow-api`, `forms-flow-forms`, and `forms-flow-idm` already up (it reads the webapi DB secret directly and cross-references Form.io/Keycloak config), hence its place in the order right after `forms-flow-api`. Build locally per the Phase 3.1 pattern (`<component>` = `forms-flow-data-layer`) — no registry key yet; this is a small, fast (~1-3 min) Python build.
+**Decision: not installing this component.** Investigated its actual purpose before troubleshooting further into an install attempt that had already hit a real ordering problem (wants a secret from `forms-flow-bpm`, not yet deployed at this point in the sequence, despite the runbook's original assumption that only `forms-flow-api`/`forms-flow-forms`/`forms-flow-idm` were prerequisites). Findings:
+- AOT's own docs describe it as "a dedicated backend component to support GraphQL... a centralized data access layer... for more efficient querying across multiple data sources" — infrastructure for *external* GraphQL consumers, not something formsflow's own shipped components route through.
+- Grepped `forms-flow-web`'s entire source: zero references to this API or GraphQL.
+- Grepped `forms-flow-analytics` (Redash): zero references either — it queries the databases directly.
+- Grepped ServeLegal's own `jag-servebc` codebase: zero references to `data-layer` or GraphQL anywhere.
 
+Nothing in this stack, and nothing ServeLegal has built, actually consumes it. It's optional infrastructure for a GraphQL-tooling use case that doesn't currently exist here — installing it would just be unused surface area (and, per the ordering problem above, actively fights the deployment sequence for no benefit). **Can be revisited later if a real GraphQL-consuming use case shows up** — nothing else in this runbook depends on it (confirmed: `forms-flow-documents-api`, `forms-flow-analytics`, `forms-flow-bpm`, `servebc-api`, `forms-flow-web` below don't reference it).
+
+Attempted and uninstalled 2026-08-18 (`helm uninstall forms-flow-data-layer -n "$NS"`) — no databases or secrets were created for it (it has none of its own; see Phase 1.4's note that it "needs no new database at all"), so nothing else to clean up.
+
+**Old command, kept for reference only if this is ever revisited:**
 ```bash
 helm upgrade --install forms-flow-data-layer ./charts/forms-flow-data-layer \
   --namespace "$NS" \
@@ -673,8 +682,7 @@ helm upgrade --install forms-flow-data-layer ./charts/forms-flow-data-layer \
   --set formsflow.secret=forms-flow-ai \
   --set formsflow.configmap=forms-flow-ai
 ```
-
-**`formsflow.webapi.secret` points at the Phase 1.3 consolidated secret, not a `forms-flow-api`-named one** — revised 2026-08-17 alongside the Phase 1.3 secrets consolidation. `forms-flow-data-layer` hardcodes the exact key names it looks for (`FORMSFLOW_API_HOSTNAME`/`FORMSFLOW_API_DB_NAME`/`FORMSFLOW_API_DB_USER`/`FORMSFLOW_API_DB_PASSWORD`, no override mechanism), which is why Phase 1.3's consolidated secret uses those specific names for the webapi entry rather than the `WEBAPI_DB_*` pattern used for the other components. `formsflow.webapi.configmap` still points at `forms-flow-api`'s own auto-created ConfigMap (unaffected by the secret change, just holds the non-sensitive port) — confirm that name against what Phase 3.5 actually creates (`common.names.fullname` resolved it to `forms-flow-api` when checked against the chart templates; verify with `oc get configmap -n "$NS"` if unsure).
+`formsflow.webapi.secret` points at the Phase 1.3 consolidated secret, not a `forms-flow-api`-named one — `forms-flow-data-layer` hardcodes the exact key names it looks for (`FORMSFLOW_API_HOSTNAME`/`FORMSFLOW_API_DB_NAME`/`FORMSFLOW_API_DB_USER`/`FORMSFLOW_API_DB_PASSWORD`, no override mechanism). **Not fully traced before abandoning**: the `secret "forms-flow-bpm" not found` `CreateContainerConfigError` — this chart apparently also expects a `forms-flow-bpm`-named secret from somewhere, undocumented in the values.yaml paths checked so far; would need investigation if this component is revisited.
 
 ### 3.7 forms-flow-documents-api (EE scope addition — stateless, no new database)
 
@@ -804,8 +812,7 @@ curl -sk -o /dev/null -w "forms-flow-forms -> HTTP %{http_code}\n" "https://form
 # webapi
 curl -sk -o /dev/null -w "forms-flow-api -> HTTP %{http_code}\n" "https://forms-flow-api-${NS}.${DOMAIN}/"
 
-# forms-flow-data-layer (no public route by default — check pod readiness instead)
-oc get pods -n "$NS" -l app.kubernetes.io/instance=forms-flow-data-layer
+# forms-flow-data-layer skipped (see Phase 3.6) — nothing to verify
 
 # forms-flow-documents-api
 curl -sk -o /dev/null -w "forms-flow-documents-api -> HTTP %{http_code}\n" "https://forms-flow-documents-${NS}.${DOMAIN}/"
@@ -838,7 +845,7 @@ helm rollback <release> <revision> -n "$NS"
 ```
 Full teardown of a bad install (reverse deployment order):
 ```bash
-for chart in forms-flow-web servebc-api forms-flow-bpm forms-flow-analytics forms-flow-documents-api forms-flow-data-layer forms-flow-api forms-flow-forms forms-flow-idm forms-flow-servebc-config forms-flow-ai; do
+for chart in forms-flow-web servebc-api forms-flow-bpm forms-flow-analytics forms-flow-documents-api forms-flow-api forms-flow-forms forms-flow-idm forms-flow-servebc-config forms-flow-ai; do
   helm uninstall "$chart" -n "$NS"
 done
 ```
