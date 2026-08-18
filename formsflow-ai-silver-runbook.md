@@ -822,9 +822,25 @@ helm upgrade --install servebc-api ./charts/servebc-api \
 
 > `database.initJob.enabled=false` because Phase 1 already created `servebcdb` manually — leave the chart's own auto-creation Job off to avoid it trying (and likely failing on privilege grounds, since it expects the DB user itself to have `CREATEDB`) to redo that work.
 
-### 3.11 forms-flow-web (frontend)
+### 3.11 forms-flow-web (frontend) — BLOCKED, 2026-08-18, real architecture gap
 
-Build locally per the Phase 3.1 pattern (`<component>` = `forms-flow-web`) — no registry key yet; small/fast Node build. Still open whether `forms-flow-web-root-config` also needs its own build/step here (see the microfrontends question flagged in the header) — resolve that before this step, not after.
+**Status: paused, not installed.** The microfrontends question flagged in the header is now fully resolved — and the answer is worse than "unconfirmed": `forms-flow-web` built from our local EE checkout genuinely **cannot serve a working page on its own**, and the real fix needs something we don't have yet (AOT's private registry access). Full investigation below; picking this back up requires either that access or a decision to hand-build a workaround.
+
+**1. Resolved the microfrontends question — EE's real frontend is 9 components, not 1.** `forms-flow-web`'s own `public/index.html` is literally `<html></html>` — it's a **single-spa microfrontend fragment** (`main: single-spa-index.js`, registers as `@formsflow/formsflow-web`), meant to be loaded by an orchestrating **root-config** shell, not visited directly. `forms-flow-web-root-config` (present in the EE repo, no existing chart) is that shell — its layout registers **five more** microfrontends we don't have in the EE checkout at all: `@formsflow/nav` (mounted on every page), `@formsflow/admin`, `@formsflow/task`, `@formsflow/submissions`, `@formsflow/integration`.
+
+**2. The user had already forked+cloned the real source for all of these** — `AOT-Technologies/forms-flow-ai-micro-front-ends` → `~/Documents/ServeLegal/code/jag-servebc-forms-flow-ai-micro-front-ends`, containing `forms-flow-admin`/`forms-flow-nav`/`forms-flow-review`/`forms-flow-submissions`/`forms-flow-integration` (route apps) plus `forms-flow-components`/`forms-flow-service`/`forms-flow-theme` (shared libraries) — 8 packages, each with its own Dockerfile+nginx.conf already present (unlike `forms-flow-web`, which was missing both and needed manual fixes). No build-time `ARG`s needed for any of them.
+
+**3. Checked how a real BC Gov tenant (RSBC, `be78d6`) actually deploys this, via their public gitops repo (`/Users/jaisethomas/Documents/RSBC/code/tenant-gitops-be78d6`) — the real model is 2 tenant-specific combined images, not 9 separate deployments:**
+   - `docker.io/formsflow/forms-flow-microfrontend:v7.0.0-rsbc-v0.3.X` — root-config + the 6 small MFEs bundled into **one** image.
+   - `docker.io/formsflow/forms-flow-web-microfrontend:v7.0.0-rsbc-v0.3.X` — the `forms-flow-web` fragment, EE/microfrontend-compatible build.
+   - Both tags are **tenant-specific** (confirmed via Docker Hub's tag API — only `-rsbc-` suffixed tags exist for `forms-flow-microfrontend`, no generic build) — AOT (or RSBC's own CI) builds and publishes a customized image per tenant. The actual "combine everything into one image" pipeline isn't visible in any repo we have access to — checked the individual MFEs' own CI (`bcgov/rsbc-forms-flow-ai-micro-front-ends`'s `.github/workflows/*-cd.yml`): each just builds via webpack and pushes static artifacts to **S3** (same pattern as OSS `forms-flow-web`'s own CI, found earlier) — the combining step is a separate, undiscovered pipeline.
+   - RSBC **also** runs a third, separate `forms-flow-web` chart (distinct from the microfrontend suite) using image `docker.io/formsflow/forms-flow-web-ee:v7.0.0` — its ConfigMap reads `REACT_APP_MF_FORMSFLOW_*_URL` values **at runtime** (not build-time, unlike the older root-config package in our EE checkout), pointing at the microfrontend suite's hosted URLs. This is likely the actual primary user-facing entry point, with those MF_* URLs providing nav/admin/task/etc as optional enhancements.
+
+**4. Tried pulling `docker.io/formsflow/forms-flow-web-ee:v7.0.0` directly (assuming it was public since no explicit pull secret appears in RSBC's config) — it isn't.** `ErrImagePull: requested access to the resource is denied`. RSBC's cluster must have AOT-provided registry credentials configured elsewhere (project-wide pull secret, not visible in their gitops repo) — this confirms the runbook's existing "AOT's private registry access key authorized but not yet obtained" blocker is real and directly applicable here, not just a historical caution.
+
+**5. Fell back to our own custom-built `forms-flow-web-ee:dev-v8.2.5` image (the original Phase 3.11 plan) — installs and runs cleanly, but serves nginx's stock placeholder page, not the app.** Confirmed via `oc exec` into the pod: `/usr/share/nginx/html/index.html` is dated `Apr 16 2025` (the base `nginx:1.27-alpine` image's own bake date) — never overwritten by our build, even though the real built JS bundle (`forms-flow-web.js`, 6.9MB, dated the same day we built it) sits right next to it. The Dockerfile's `COPY --from=build-stage .../build /usr/share/nginx/html` step is correct; the problem is upstream — the build's own output genuinely doesn't contain a real `index.html`, tracing back to the empty `public/index.html` template in point 1. **Not a fixable Dockerfile/nginx bug** — this version of the EE source is built as a pure microfrontend fragment, full stop.
+
+**Decision (user's call): pause here, move to `servebc-api`, revisit once AOT's private registry access is actually obtained** (needed either for the working `forms-flow-web-ee:v7.0.0` image directly, or for whatever tenant-specific combined-image build process AOT/the registry access unlocks). The attempted install was uninstalled (`helm uninstall forms-flow-web`) since it only served a non-functional placeholder. Old command kept below for reference:
 
 ```bash
 helm upgrade --install forms-flow-web ./charts/forms-flow-web \
@@ -832,16 +848,20 @@ helm upgrade --install forms-flow-web ./charts/forms-flow-web \
   --set image.registry=image-registry.openshift-image-registry.svc:5000 \
   --set image.repository="${TOOLS_NS}/forms-flow-web-ee" \
   --set image.tag="${ENV}-v8.2.5" \
+  --set "image.pullSecrets[0]=default-dockercfg-ng9fs" \
   --set ingress.hostname="forms-flow-web-${NS}.${DOMAIN}" \
   --set ingress.tls=true \
+  --set ingress.selfSigned=true \
+  --set-string IsEnterPrise=true \
   --set web.base_custom_url="https://servebc-api-${NS}.${DOMAIN}" \
   --set web.custom_theme_url="" \
-  --set web.enable_forms_module=true \
-  --set web.enable_tasks_module=true \
-  --set web.enable_dashboards_module=false \
-  --set web.enable_processes_module=true \
-  --set web.enable_applications_module=true
+  --set-string web.enable_forms_module=true \
+  --set-string web.enable_tasks_module=true \
+  --set-string web.enable_dashboards_module=false \
+  --set-string web.enable_processes_module=true \
+  --set-string web.enable_applications_module=true
 ```
+Note this chart's `web.enable_*_module`/`IsEnterPrise` values are **booleans in Helm's type system but the template runs `tpl` on them expecting strings** — pass via `--set-string`, not `--set`, or `helm` errors with `wrong type for value; expected string; got bool`.
 
 ---
 
