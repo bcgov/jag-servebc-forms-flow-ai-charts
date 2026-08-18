@@ -157,7 +157,7 @@ oc get routes,svc -n "$NS" -o yaml > "$HOME/openshift-export-${ENV}/routes-svc-s
 
 ## Phase 1 — New databases on existing Patroni + Mongo (fresh-install scope — new empty DBs, no data migration)
 
-**Status for `dev`: 1.1–1.3 done (2026-08-11)**, for the original 4 components (bpm/webapi/keycloak/servebc). Full results and the two corrections below in [`reports/2026-08-11-upgrade-progress-status.md`](reports/2026-08-11-upgrade-progress-status.md). **1.4 (`forms-flow-analytics`) is new as of the 2026-08-17 scope expansion and not yet run.** Two things the original draft got wrong, already corrected below:
+**Status for `dev`: Phase 1 fully done (1.1–1.4), as of 2026-08-17.** 1.1–1.3 first completed 2026-08-11 for the original 4 components (bpm/webapi/keycloak/servebc); full results and the two corrections below in [`reports/2026-08-11-upgrade-progress-status.md`](reports/2026-08-11-upgrade-progress-status.md). 1.4 (`forms-flow-analytics`) added and run 2026-08-17 as part of the EE scope expansion. Databases were subsequently renamed from the `731` to the `_82` suffix scheme the same day (see the `DB_SUFFIX` naming note above) — Postgres by reusing existing plain-named roles against new suffixed databases, Mongo (1.2) by dropping `formio731`/`formiouser731` and recreating as database `formio_82` with a plain (unsuffixed) user `formiouser`, matching the "database gets the tag, user doesn't" convention Postgres already used. Two things the original draft got wrong, already corrected below:
 - The Mongo root credential is **not** `MONGO_INITDB_ROOT_USERNAME`/`MONGO_INITDB_ROOT_PASSWORD` — `formio-mongodb-dev` uses the classic OpenShift `mongodb-persistent` template convention instead: secret key `admin-password` paired with the fixed username `admin`.
 - `mongosh` (bundled in `mongo:5.0`+ client images) refuses to connect — `formio-mongodb-dev` is running **MongoDB 3.6.3**, and modern drivers require ≥4.2. Use the legacy `mongo` shell (`mongo:4.4` image) instead. **This is a real open risk for Phase 3.4** (`forms-flow-forms`) if its bundled Node.js driver has the same floor — check before running that step.
 
@@ -198,6 +198,10 @@ SQL
 
 ### 1.2 Mongo — Form.io database
 
+**Status for `dev`: done (2026-08-17, renamed same day).** First pass (2026-08-11) created `formio731`/`formiouser731`, using the app-version-coupled suffix scheme that was later abandoned for Postgres (see the `DB_SUFFIX` naming note above). Revised 2026-08-17 to match: dropped `formiouser731` (the `formio731` database itself had never actually materialized — Mongo doesn't create a database until it holds data, so there was nothing to drop there, just the user), created database `formio_82` with a **plain, unsuffixed** user `formiouser` — matching the Postgres convention exactly (only the database name carries the generation tag; the user doesn't). Note this user is *not* a reuse of the old stack's existing Mongo user (which is named `formio`, not `formiouser`, and stays scoped to the old `formio` database) — it's a fresh user, just deliberately given the plain name rather than a suffixed one. **Credentials are now also written into the Phase 1.3 consolidated secret (`FORMIO_DB_HOST/PORT/NAME/USER/PASSWORD`)** rather than kept only in a shell variable — the original draft lost `$FORMIO_DB_PASS` the moment the session ended, since nothing persisted it; this fixes that for good.
+
+**Run-order note for a from-scratch environment:** the `oc patch secret formsflow-db-82` line below depends on that secret already existing, which normally happens in **1.3, below this section** — despite 1.2 being numbered before 1.3. On a fresh environment, run 1.1 → 1.3 (base secret, no Mongo keys yet) → 1.2 (this section, patches Mongo keys in) → 1.4 (patches analytics key in, same pattern). This mirrors how 1.4 already patches into the 1.3 secret; 1.2 just wasn't following that pattern until this revision.
+
 ```bash
 # formio-mongodb-dev is normally scaled to 0 — scale it up first, this will fail against a Service
 # with no endpoints otherwise.
@@ -213,12 +217,16 @@ FORMIO_DB_PASS=$(openssl rand -base64 24)
 # MongoDB 4.2"). Use the legacy `mongo` shell via an older client image instead.
 oc run mongo-client --rm -i --restart=Never -n "$NS" --image=mongo:4.4 -- \
   mongo "mongodb://admin:${MONGO_ADMIN_PASS}@formio-mongodb-dev:27017/admin" --eval "
-    db.getSiblingDB('formio${DB_SUFFIX}').createUser({
-      user: 'formiouser${DB_SUFFIX}',
+    db.getSiblingDB('formio_82').createUser({
+      user: 'formiouser',
       pwd: '${FORMIO_DB_PASS}',
-      roles: [{ role: 'readWrite', db: 'formio${DB_SUFFIX}' }]
+      roles: [{ role: 'readWrite', db: 'formio_82' }]
     })
   "
+
+# Persist into the Phase 1.3 consolidated secret immediately — don't rely on the shell var surviving.
+oc patch secret formsflow-db-82 -n "$NS" --type=merge -p \
+  "{\"stringData\":{\"FORMIO_DB_HOST\":\"formio-mongodb-dev\",\"FORMIO_DB_PORT\":\"27017\",\"FORMIO_DB_NAME\":\"formio_82\",\"FORMIO_DB_USER\":\"formiouser\",\"FORMIO_DB_PASSWORD\":\"${FORMIO_DB_PASS}\"}}"
 
 # Scale back down — it's normally idle along with the rest of the old stack.
 oc scale dc/formio-mongodb-dev -n "$NS" --replicas=0
@@ -251,7 +259,7 @@ oc create secret generic formsflow-db-82 -n "$NS" \
 
 The `webapi` entry uses `FORMSFLOW_API_*` naming rather than `WEBAPI_DB_*` (inconsistent-looking on purpose) — `forms-flow-data-layer`'s chart **hardcodes** references to keys named exactly `FORMSFLOW_API_HOSTNAME`/`FORMSFLOW_API_DB_NAME`/`FORMSFLOW_API_DB_USER`/`FORMSFLOW_API_DB_PASSWORD` in whatever secret `formsflow.webapi.secret` points at (Phase 3.6), with no override mechanism of its own — checked, confirmed no other component has a hidden hardcoded dependency like this. Matching `forms-flow-api`'s own chart-default key names here means one set of keys satisfies both `forms-flow-api` (Phase 3.5) and `forms-flow-data-layer` (Phase 3.6) simultaneously.
 
-Deliberately a *separate* object from the `forms-flow-ai` chart's own Helm-managed secret (also just named `forms-flow-ai`, see Phase 3.1) rather than merged into it — a Helm-templated secret gets fully re-rendered on every `helm upgrade`, so hand-added keys not in that chart's own template would silently disappear on the next upgrade. `ANALYTICS_DB_CONNECTION_STRING` gets added to this same secret once Phase 1.4 (below) actually creates that database — `forms-flow-analytics` wants a single connection-string key, not split host/user/password fields like the others, so it doesn't fit the pattern above directly.
+Deliberately a *separate* object from the `forms-flow-ai` chart's own Helm-managed secret (also just named `forms-flow-ai`, see Phase 3.1) rather than merged into it — a Helm-templated secret gets fully re-rendered on every `helm upgrade`, so hand-added keys not in that chart's own template would silently disappear on the next upgrade. `ANALYTICS_DB_CONNECTION_STRING` gets added to this same secret once Phase 1.4 (below) actually creates that database — `forms-flow-analytics` wants a single connection-string key, not split host/user/password fields like the others, so it doesn't fit the pattern above directly. **`FORMIO_DB_HOST/PORT/NAME/USER/PASSWORD` are likewise patched in from Phase 1.2** (Mongo, not Postgres — split fields work fine there since `forms-flow-ai`'s `secrets.yaml` template builds its own `mongodb://` URI from `--set` values rather than reading a connection string, see Phase 3.1) rather than included in the initial `oc create secret` below, since Phase 1.2 runs before this step and patches them in directly at creation time.
 
 **`forms-flow-servebc-config` is the one exception** — it's this org's own custom chart, not yet ported into `charts/` (that happens in Phase 2), and as of the version validated locally it has no `existingSecret` support at all; it builds its own secret directly from `--set database.*` values. Left as-is for now (Phase 3.2 still needs `SERVEBC_DB_PASS`/user/host/name passed explicitly) — revisit adding `existingSecret` support to that chart once it's actually in this repo, if it's worth the churn.
 
@@ -319,14 +327,21 @@ Deployment order (dependency-correct, matches the chart repo's own documented or
 ### 3.1 forms-flow-ai (infra shell — Redis only; Postgres/Mongo externalized)
 
 ```bash
+# Source Mongo creds from the Phase 1.3/1.2 consolidated secret rather than a shell var that may
+# not exist in this session — this is what actually fixed the "$FORMIO_DB_PASS lost between
+# sessions" problem the 731 -> _82 rename ran into.
+FORMIO_DB_NAME=$(oc get secret formsflow-db-82 -n "$NS" -o jsonpath='{.data.FORMIO_DB_NAME}' | base64 -d)
+FORMIO_DB_USER=$(oc get secret formsflow-db-82 -n "$NS" -o jsonpath='{.data.FORMIO_DB_USER}' | base64 -d)
+FORMIO_DB_PASS=$(oc get secret formsflow-db-82 -n "$NS" -o jsonpath='{.data.FORMIO_DB_PASSWORD}' | base64 -d)
+
 helm upgrade --install forms-flow-ai ./charts/forms-flow-ai \
   --namespace "$NS" \
   --set Domain="${NS}.${DOMAIN}" \
   --set postgresql-ha.enabled=false \
   --set mongodb.enabled=false \
-  --set mongodb.auth.usernames[0]="formiouser${DB_SUFFIX}" \
+  --set mongodb.auth.usernames[0]="$FORMIO_DB_USER" \
   --set mongodb.auth.passwords[0]="$FORMIO_DB_PASS" \
-  --set mongodb.auth.databases[0]="formio${DB_SUFFIX}" \
+  --set mongodb.auth.databases[0]="$FORMIO_DB_NAME" \
   --set mongodb.service.nameOverride=formio-mongodb-dev \
   --set mongodb.service.ports.mongodb=27017 \
   --set redisExporter.persistence.storageClass=netapp-block-standard
@@ -337,6 +352,8 @@ oc wait --namespace "$NS" --for=condition=ready pod \
 ```
 
 `redisExporter.persistence.storageClass` routes the new Redis PVC to `netapp-block-standard` instead of the default `netapp-file-standard` — per Phase 0, the default class is ~89% full in `dev`; this is the only PVC any Phase 3 chart creates (confirmed by grepping every chart's templates for `PersistentVolumeClaim`/`VolumeClaimTemplate`), so this one `--set` clears the storage-quota risk entirely. `ingress.ingressClassName` is intentionally omitted from every `--set` in this phase (not just here) — see the Phase 0 note above.
+
+**Mongo renamed to match Postgres's naming convention (2026-08-17)** — the original `formio731`/`formiouser731` (created before `DB_SUFFIX` changed from `731` to `_82`) has been dropped and recreated as database `formio_82` with a plain, unsuffixed user `formiouser`, per Phase 1.2 above — same "database tagged, user not" pattern as `bpmdb_82`/`bpmuser` etc. Sourced from the `formsflow-db-82` secret rather than hardcoded here, since Mongo's database naming doesn't mechanically follow `${DB_SUFFIX}` the way Postgres's does (fresh database each generation, not a suffix applied cleanly by string substitution) — reading it from the secret avoids the two ever silently drifting apart again.
 
 **⚠️ The `mongodb.auth.*`/`mongodb.service.*` lines above are not optional — this chart has a real wiring bug that needs working around, found 2026-08-17.** `charts/forms-flow-ai/templates/secrets.yaml` auto-generates the `NODE_CONFIG`/`MONGODB_URI` keys in this chart's own central secret (see Phase 3.4's note) **entirely from `.Values.mongodb.auth.*`/`.Values.mongodb.service.*`** — i.e. the config for the chart's *own bundled Bitnami mongodb subchart* — regardless of whether `mongodb.enabled` is `true` or `false`. Setting `mongodb.enabled=false` alone (the Patroni/Mongo-externalization decision from earlier) stops the bundled subchart from deploying, but does **not** stop this template from generating `NODE_CONFIG` out of those same values — which, left at their chart defaults, would silently point at infrastructure that doesn't exist. The `--set` lines above repurpose those "would-be bundled Mongo" values to describe the *real* external `formio-mongodb-dev` instance and its actual Phase 1.2 credentials instead, so the auto-generated `NODE_CONFIG`/`MONGODB_URI` come out correct. Confirm explicitly in Phase 4 (e.g. exec into a pod that reads `NODE_CONFIG` and check the value, or just watch whether `forms-flow-forms` connects successfully) rather than assuming this is fixed just because the values are now set correctly — this exact class of bug (wrong value, no error until runtime) is why it went unnoticed in the original draft.
 
