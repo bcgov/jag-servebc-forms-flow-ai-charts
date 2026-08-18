@@ -96,8 +96,6 @@ keycloak:
     - name: formsflow-themes
       image: formsflow/keycloak-customizations:v7.3.0
       imagePullPolicy: Always
-      securityContext:
-        runAsUser: 1001
       command: ["/bin/sh","-c"]
       args:
       - "mkdir -p /opt/bitnami/keycloak/themes /opt/bitnami/keycloak/providers /opt/bitnami/keycloak/import && \
