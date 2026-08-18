@@ -745,16 +745,31 @@ helm upgrade --install forms-flow-analytics ./charts/forms-flow-analytics \
 
 ### 3.9 forms-flow-bpm (vanilla — no custom Java extensions per plan decision)
 
-Build locally per the Phase 3.1 pattern (`<component>` = `forms-flow-bpm`) — no registry key yet. Also an explicit candidate for actual customization ("Camunda/API may need customizations" — TBD, not yet decided), which a local build accommodates either way. This is the one heavy build in the set — Maven multi-module, no dependency caching between OpenShift BuildConfig runs by default, likely 5-10+ min. Budget for that rather than being surprised by it.
+**Status for `dev`: done, 2026-08-18 — clean install, no new bugs found.** First component in a while to go through cleanly on the first real attempt, using the by-now-established checklist (collision check, TLS self-signed cert, cross-namespace pull-secret link + override, CPU quota headroom check before the heaviest remaining build). `image.registry`/`.repository`/`.tag` at the top level (not nested under `camunda.*`) confirmed correct against `charts/forms-flow-bpm/values.yaml` — the "not verified during planning" caution below turned out fine.
+
+Build locally per the Phase 3.1 pattern (`<component>` = `forms-flow-bpm`) — no registry key yet. Also an explicit candidate for actual customization ("Camunda/API may need customizations" — TBD, not yet decided), which a local build accommodates either way. This is the one heavy build in the set — Maven multi-module, no dependency caching between OpenShift BuildConfig runs by default, likely 5-10+ min. Budget for that rather than being surprised by it. (Already built 2026-08-17, tag `dev-v8.2.5`, still present in `a60371-tools` — no rebuild needed unless picking up newer EE source changes.)
+
+**Chart's default resources (`500m`/`600m` CPU request/limit) are modest — checked against quota headroom before installing** given the quota wall hit in Phase 3.8: `2200m` used / `4000m` cap at the time, comfortably enough room. Confirmed after install: `2700m` used, `1300m` free — no override needed here, unlike `forms-flow-analytics`.
 
 ```bash
+HOST="forms-flow-bpm-${NS}.${DOMAIN}"
+BPM_CLIENT_SECRET=$(oc get secret formsflow-admin-secrets-82 -n "$NS" -o jsonpath='{.data.BPM_CLIENT_SECRET}' | base64 -d)
+
+# TLS — established pattern since Phase 3.4.
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+  -keyout /tmp/selfsigned.key -out /tmp/selfsigned.crt -subj "/CN=${HOST}"
+oc create secret tls "${HOST}-tls" -n "$NS" --cert=/tmp/selfsigned.crt --key=/tmp/selfsigned.key
+rm -f /tmp/selfsigned.key /tmp/selfsigned.crt
+
 helm upgrade --install forms-flow-bpm ./charts/forms-flow-bpm \
   --namespace "$NS" \
   --set image.registry=image-registry.openshift-image-registry.svc:5000 \
   --set image.repository="${TOOLS_NS}/forms-flow-bpm-ee" \
   --set image.tag="${ENV}-v8.2.5" \
-  --set ingress.hostname="forms-flow-bpm-${NS}.${DOMAIN}" \
+  --set "image.pullSecrets[0]=default-dockercfg-ng9fs" \
+  --set ingress.hostname="${HOST}" \
   --set ingress.tls=true \
+  --set ingress.selfSigned=true \
   --set camunda.ExternalDatabase.ExistingSecretName=formsflow-db-82 \
   --set camunda.ExternalDatabase.ExistingDatabaseHostKey=BPM_DB_HOST \
   --set camunda.ExternalDatabase.ExistingDatabaseNameKey=BPM_DB_NAME \
@@ -769,10 +784,11 @@ helm upgrade --install forms-flow-bpm ./charts/forms-flow-bpm \
 # those CHES vars (via extraEnvVarsSecret/extraEnvVarsCM wiring — check whether forms-flow-bpm's
 # values.yaml has that hook, same as servebc-api does) rather than assuming email works untested.
 
+oc secrets link forms-flow-bpm default-dockercfg-ng9fs --for=pull -n "$NS"
 oc wait --namespace "$NS" --for=condition=available deployment/forms-flow-bpm --timeout=300s
 ```
 
-> Confirm the exact `image.*` value paths against `charts/forms-flow-bpm/values.yaml` before running — not verified during planning, may nest differently than the `image.registry`/`.repository`/`.tag` split assumed here (the chart's `camunda.*` values suggest a Camunda-specific structure that might extend to image config too).
+**Confirmed working live 2026-08-18** — pod `1/1 Running`, no restarts; boot logs show a full clean startup (Tomcat on `8080`/`camunda` context, showcase process definitions deployed to the DB with no errors, job executor started, ~33s JVM boot); route shows `TERMINATION: edge/Redirect`; `curl -sk https://.../camunda/actuator/health` → `HTTP 200`. Camunda's DB connectivity to `bpmdb_82` on Patroni implicitly confirmed by the successful process-definition deployment (would have failed loudly otherwise). CHES email wiring not yet explicitly tested — still a Phase 4 item, per the note above.
 
 **DB wiring revised 2026-08-17** — dropped the old `camunda.jdbc.url`/`.username`/`.password`/`camunda.database.name` values (confirmed against `charts/forms-flow-bpm/templates/deployment.yaml`: `camunda.jdbc.url`'s default already builds itself from the same `CAMUNDA_DATABASE_SERVICE_NAME`/`_PORT`/`_NAME` env vars that `camunda.ExternalDatabase.*` populates, so hardcoding a literal URL alongside those was redundant and risked drift if one changed without the other) in favor of pointing `camunda.ExternalDatabase.ExistingSecretName` at the Phase 1.3 consolidated secret, same pattern as `forms-flow-api`. `camunda.database.port` stays as a plain value — not sensitive, not part of the consolidated secret.
 
