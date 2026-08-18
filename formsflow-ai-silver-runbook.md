@@ -465,12 +465,33 @@ oc wait --namespace "$NS" --for=condition=ready pod \
 
 Confirmed working end-to-end for `dev` 2026-08-17: Keycloak pod `1/1 Running`, route reachable (`curl .../auth/realms/master/.well-known/openid-configuration` → `HTTP 200`), no bundled-Postgres resources left behind (Helm pruned the StatefulSet/Deployment created by the first, broken attempt once `postgresql-ha.enabled=false` was set correctly on the follow-up `helm upgrade`).
 
-**Realm rebuild** (fresh-install scope — recreate the structure from the old realm as a template, not a raw DB migration; reference: this session's `openshift-export/CURRENT-CONFIG-a60371-dev.md` for the exact structure being replicated):
+**Realm rebuild — done for `dev` 2026-08-18, via a real export/import from the still-running old Keycloak rather than guessing the structure.** What actually happened, in order:
+
+1. **Don't guess the group/client/IDP structure — export it from the old realm.** The original plan here was to recreate the group tree/IDIR broker config from memory/docs. `CURRENT-CONFIG-a60371-dev.md` doesn't actually contain the group tree (only DC env vars) — and a first attempt at guessing it (by an earlier, disconnected session) produced plausible-looking but **wrong** group names (`approver`/`clerk` instead of the real `management`/`access-allow-submissions`/`staff`; generic `group1`/`group2` instead of `staff-reports`). Caught this by pulling the real structure straight from the old Keycloak's admin API (`POST /admin/realms/forms-flow-ai/partial-export?exportClients=true&exportGroupsAndRoles=true`) — the actual source of truth, still running (scaled to 0 normally; scale up for this, same pattern as Mongo in Phase 1.2). Saved to `openshift-export/old-keycloak-realm-export-<date>.json` (outside this repo, gitignored, matches the existing export convention).
+   - **The old `keycloak` DC's admin credentials live in the `forms-flow-ai` secret — the same secret this runbook's Phase 3 pre-step deleted.** Don't recreate that secret (would collide with the new Helm-owned one of the same name). Instead: create a differently-named temp secret with the old `KEYCLOAK_USER`/`KEYCLOAK_PASSWORD` values (already backed up in `openshift-export/secrets-decoded/forms-flow-ai.env`), `oc set env dc/keycloak --from=secret/<temp-name>` to repoint just those two env vars, scale up, do the export, then **revert**: scale back to 0, patch the DC's env back to reference `forms-flow-ai` again, delete the temp secret. Old stack ends up byte-identical to before, just temporarily readable.
+   - **`curl -d` doesn't URL-encode form data — a generated password containing `+` breaks Keycloak token auth silently** (server decodes `+` as a space per `application/x-www-form-urlencoded`, "Invalid user credentials" with no hint why). Always use `--data-urlencode` for the token request's `username`/`password` fields, not `-d`, whenever a password may contain `+`/`&`/etc. (which `openssl rand -base64` output frequently does).
+2. **Real group structure** (confirmed from the export, now live in the new realm):
+   ```
+   /camunda-admin
+   /formsflow
+     /formsflow-designer
+     /formsflow-reviewer
+       /management
+       /access-allow-submissions
+       /staff
+     /formsflow-client
+   /formsflow-analytics
+     /staff-reports
+   ```
+   (`/realm-management` also appears in the old export but is a Keycloak built-in client-role group, not custom — not recreated separately here.)
+3. **Real IDIR identity provider recovered — config known, secret still missing.** The old realm's broker is `keycloak-oidc-gold` (display name "IDIR"), a BC Gov Common Hosted SSO (CSS) integration federating to `dev.loginproxy.gov.bc.ca`'s `standard` realm via OIDC, `clientId=serve-legal-documents-4299`, `client_secret_basic`. All URLs (auth/token/userinfo/jwks/issuer/logout) came through the export intact — **Keycloak's partial-export always redacts `clientSecret`**, and it isn't stored anywhere else in this namespace either (checked every secret). Created in the new realm with the full recovered config but **`enabled: false`** and a placeholder `clientSecret` — get the real secret from whoever manages the `serve-legal-documents-4299` integration on the BC Gov CSS/SSO portal (`bcgov.github.io/sso-requests` or your team's equivalent), then `PUT` it in and flip `enabled: true`.
+4. **A pre-existing `forms-flow-analytics` SAML client (from the same disconnected session) doesn't match anything in the old realm either** — it has a `localhost:7000` redirect URI, clearly generic/placeholder, whereas the old realm actually had **3 different real SAML clients** for external reporting callbacks (`analytics-a60371-dev.apps.silver...`, `servebc-reports.dev.jag.gov.bc.ca`, `my-reports-dev.ospg.psfs.gov.bc.ca` — all in the export). Left as-is for now since `forms-flow-analytics` itself isn't deployed until Phase 3.8 — **needs a decision before that step**: recreate the 3 real SAML clients (if that external reporting integration is still needed) or replace this placeholder with something intentional.
 
 ```bash
 KC_HOST="https://forms-flow-idm-${NS}.${DOMAIN}/auth"
 TOKEN=$(curl -sk -X POST "${KC_HOST}/realms/master/protocol/openid-connect/token" \
-  -d "client_id=admin-cli" -d "username=admin" -d "password=${KEYCLOAK_ADMIN_PASS}" -d "grant_type=password" \
+  --data-urlencode "client_id=admin-cli" --data-urlencode "username=admin" \
+  --data-urlencode "password=${KEYCLOAK_ADMIN_PASS}" --data-urlencode "grant_type=password" \
   | jq -r .access_token)
 
 # 1. Create realm
@@ -484,24 +505,24 @@ curl -sk -X POST "${KC_HOST}/admin/realms/forms-flow-ai/clients" -H "Authorizati
 curl -sk -X POST "${KC_HOST}/admin/realms/forms-flow-ai/clients" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d "{\"clientId\":\"forms-flow-bpm\",\"publicClient\":false,\"secret\":\"${BPM_CLIENT_SECRET}\",\"serviceAccountsEnabled\":true}"
 
-# 3. Recreate groups matching the a60371-dev structure documented in CURRENT-CONFIG-a60371-dev.md:
-#    /formsflow/formsflow-client, /formsflow/formsflow-reviewer (+staff, management,
-#    access-allow-submissions subgroups), /formsflow/formsflow-designer,
-#    /formsflow-analytics/staff-reports, /camunda-admin, /realm-management
-#    (loop pattern — repeat per group path via POST .../groups, nesting children under the
-#    returned parent group id for subgroups)
+# Persist the BPM client secret durably immediately (same lesson as $FORMIO_DB_PASS/$KEYCLOAK_ADMIN_PASS earlier)
+oc patch secret formsflow-admin-secrets-82 -n "$NS" --type=merge -p \
+  "{\"stringData\":{\"BPM_CLIENT_SECRET\":\"${BPM_CLIENT_SECRET}\"}}"
 
-# 4. Recreate the 3 synthetic users (formsflow-client/reviewer/designer) in their matching groups —
-#    same pattern already used successfully earlier this session for a60371-dev (POST .../users,
-#    then PUT .../users/{id}/reset-password, then PUT .../users/{id}/groups/{groupId})
+# 3. Recreate the real group tree (see the structure above) — top-level groups first, then subgroups
+#    nested under the returned parent group id (POST .../groups for top-level, POST
+#    .../groups/{parentId}/children for subgroups).
 
-# 5. Configure IDIR as an Identity Provider (broker) for the 2 real staff accounts — reuse whatever
-#    IDIR broker config pattern other BC Gov apps in this project use (check `dev.loginproxy.gov.bc.ca`
-#    /`dev.oidc.gov.bc.ca` conventions with the platform team if this isn't already documented
-#    elsewhere) rather than guessing the exact client config here.
+# 4. Recreate the 3 synthetic test users (formsflow-client/designer/reviewer) — POST .../users,
+#    PUT .../users/{id}/reset-password, PUT .../users/{id}/groups/{groupId}. Placed formsflow-reviewer
+#    in the /formsflow/formsflow-reviewer/staff subgroup specifically (not the parent formsflow-reviewer
+#    group, and not management/access-allow-submissions) as the general-case reviewer role for testing.
+
+# 5. IDIR identity provider — see point 3 above. Config is real and complete; enabled:false with a
+#    placeholder clientSecret until the real one is retrieved from the CSS/SSO portal.
 ```
 
-> Save `$BPM_CLIENT_SECRET` — you'll pass it into both `forms-flow-bpm`'s and `forms-flow-api`'s installs below.
+> `$BPM_CLIENT_SECRET`, `$KEYCLOAK_ADMIN_PASS`, and the 3 test users' passwords are all persisted in `formsflow-admin-secrets-82` / `formsflow-test-users-82` (`oc create secret` alongside the steps above) — don't rely on shell variables surviving between sessions, same lesson as `$FORMIO_DB_PASS` in Phase 1.2.
 
 ### 3.4 forms-flow-forms (Form.io)
 
