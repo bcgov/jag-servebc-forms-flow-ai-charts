@@ -702,16 +702,46 @@ helm upgrade --install forms-flow-documents-api ./charts/forms-flow-documents-ap
 
 ### 3.8 forms-flow-analytics (EE scope addition — new `analyticsdb${DB_SUFFIX}` from Phase 1.4, shared Redis)
 
+**Status for `dev`: done, 2026-08-18.** This chart is a different lineage from everything else in this runbook (Redash's own upstream chart, not built on the same Bitnami `common.ingress` pattern) — several of its value paths don't work the way the rest of this runbook's pattern would suggest. Four real issues found; detail below the install command.
+
 **No build needed** — this chart's default image is `docker.io/formsflow/redash:24.04.0`, a public image, unrelated to the EE source or private registry. `postgresql.enabled`/`redis.enabled` already default to `false` in this chart — no need to set them. `externalRedis` already defaults to `forms-flow-ai`'s own `redis-exporter` service, so nothing to set there either.
 
 ```bash
+export DOMAIN_HOST="forms-flow-analytics-${NS}.${DOMAIN}"  # reused below, avoid retyping
+
+# TLS — same pattern established in Phase 3.4.
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+  -keyout /tmp/selfsigned.key -out /tmp/selfsigned.crt -subj "/CN=${DOMAIN_HOST}"
+oc create secret tls "${DOMAIN_HOST}-tls" -n "$NS" --cert=/tmp/selfsigned.crt --key=/tmp/selfsigned.key
+rm -f /tmp/selfsigned.key /tmp/selfsigned.crt
+
 helm upgrade --install forms-flow-analytics ./charts/forms-flow-analytics \
   --namespace "$NS" \
-  --set ingress.hostname="forms-flow-analytics-${NS}.${DOMAIN}" \
-  --set ingress.tls=true \
+  --set-json "ingress.hosts=[{\"host\":\"${DOMAIN_HOST}\",\"paths\":[\"/redash\",\"/setup\"]}]" \
+  --set-json "ingress.tls=[{\"hosts\":[\"${DOMAIN_HOST}\"],\"secretName\":\"${DOMAIN_HOST}-tls\"}]" \
+  --set "server.env.REDASH_HOST=https://${DOMAIN_HOST}/redash" \
+  --set "server.env.REDASH_PROXIES_COUNT=1" \
   --set externalPostgreSQLSecret.name=formsflow-db-82 \
-  --set externalPostgreSQLSecret.key=ANALYTICS_DB_CONNECTION_STRING
+  --set externalPostgreSQLSecret.key=ANALYTICS_DB_CONNECTION_STRING \
+  --set server.resources.requests.cpu=200m \
+  --set server.resources.limits.cpu=1500m \
+  --set worker.resources.requests.cpu=100m \
+  --set worker.resources.limits.cpu=1000m \
+  --set scheduler.resources.requests.cpu=100m \
+  --set scheduler.resources.limits.cpu=1000m
 ```
+
+**1. `ingress.hostname`/`ingress.tls=true` (the pattern used everywhere else) doesn't apply here at all.** This chart's ingress template is hand-written, not the Bitnami `common.ingress` helper — it expects `ingress.hosts` (a **list** of `{host, paths}`, not a single `hostname` string) and `ingress.tls` (a **list** of `{hosts, secretName}`, not a boolean). Passing `ingress.tls=true` as everywhere else literally crashes the template (`range can't iterate over true`). Also, unlike every path-prefixed component so far, an **empty `paths: []` renders no route rule at all** for that host — at least one path is required.
+
+**2. Nginx sidecar requires exactly `/redash` (and separately `/setup`) as routed paths — confirmed by reading its own config.** `charts/forms-flow-analytics/templates/proxy-config.yaml`'s nginx config only has a `location /redash/ { ... proxy_set_header SCRIPT_NAME /redash; ... }` block, plus a special `location = /setup { return 301 /redash/setup; }` — meaning the app's own first-run "no organization yet" redirect target (`/setup`, no prefix) needs to be separately routable too, or it 503s at the OpenShift router before ever reaching nginx's own redirect-fixup rule. Both paths are in the `ingress.hosts[0].paths` list above.
+
+**3. `redash.host`/`redash.proxiesCount` (and every other `redash.*` config value) silently never reach the server container — a real chart bug, not a values typo.** `templates/server-deployment.yaml` builds a scoped `$envCtx` for its env-var helper as `mergeOverwrite (deepCopy .) (dict "Values" (dict "env" .Values.server.env))` — this **replaces** `.Values` entirely with just `{env: .Values.server.env}` rather than merging, so inside the shared `redash.env` helper, `.Values.redash.host` (and everany other `.Values.redash.*` field) simply doesn't exist for the server container, and Helm's `with` silently renders nothing — no error, no warning. Confirmed via `oc get pod ... -o jsonpath` showing no `REDASH_HOST` env var at all after setting `--set redash.host=...` and a full reinstall. **Workaround: use `server.env.<KEY>=<value>` instead** — `.Values.server.env` is a free-form passthrough map (the one thing that *does* actually reach the container, since it's what the broken context override keeps), and the helper has a generic `{{- range $key, $value := .Values.env }}` loop that dumps it as raw env vars. Used this to set `REDASH_HOST` (so the app can construct correct absolute URLs) and `REDASH_PROXIES_COUNT=1` (werkzeug's ProxyFix, so Flask trusts nginx's `X-Forwarded-Proto`/`X-Forwarded-Host` headers instead of generating raw pod-internal URLs).
+   **Known remaining minor issue, not a functional blocker**: the app's very-first-load redirect (bare `/redash/` → `/setup`, before any Redash organization exists) still generates a malformed `http://<host>:8080/redash/setup` URL even with the fix above — this one specific redirect appears to bypass Flask's normal URL-building path entirely (a raw `redirect('/setup')` not going through `url_for`/ProxyFix). **Workaround: navigate directly to `https://<host>/redash/setup`** to complete first-run setup — confirmed that page loads correctly (`HTTP 200`, correct `/redash/`-prefixed asset links via nginx's `sub_filter`, which rewrites page *content* correctly — `sub_filter` just doesn't touch the `Location` response *header* a redirect uses, which is the actual gap). Once an organization exists, this specific redirect should never fire again in normal use — not investigated further given it's cosmetic and one-time.
+
+**4. Chart's default CPU requests are sized for production, not this `dev` namespace — hit a real quota wall.** Default: server `900m` + 4 workers/scheduler × `200m` = **1750m** requested just for this one component. `a60371-dev`'s `compute-long-running-quota` caps `requests.cpu` at `4` cores cluster-namespace-wide, and between the old v4.0.8 stack (partially still running) and the new stack's 5 already-deployed components, only ~600m of headroom remained — not enough for even a single rolling-update surge (needs old+new pod briefly coexisting). First attempt at reducing requests (`server.resources.requests.cpu=200m`, dropping *limits* to match) caused a **different** failure — `context deadline exceeded` on the readiness/liveness probes (1s timeout), i.e. CPU-throttling under load right after cold start. **Fix: lower `requests.cpu` (what the quota actually counts) but keep `limits.cpu` generous** (`1500m` server / `1000m` workers — close to chart defaults) — the ResourceQuota only tracks `requests`, not `limits`, so this frees real quota headroom without under-provisioning the container's actual burst capacity. Confirmed working: all 5 pods `Running`/`Ready`, no more probe timeouts.
+   **Also freed additional headroom the same session, per the user's direction: scaled the old stack's still-running `forms-flow-web`/`forms-flow-webapi` DeploymentConfigs to 0** (`oc scale dc/forms-flow-web dc/forms-flow-webapi --replicas=0`) — these aren't needed running continuously any more than `formio-mongodb-dev`/`keycloak` were before Phase 3.3/3.4 made them real dependencies; scale back up temporarily only if something needs exporting from them, same pattern as Mongo/Keycloak's temporary scale-ups earlier. **If quota pressure recurs in later phases, re-check `oc describe quota compute-long-running-quota -n "$NS"` before assuming a new chart bug** — worth checking first, given how it presented here (a `CreateContainerConfigError`-*adjacent* class of failure, easy to mistake for another wiring bug).
+
+**Follow-up, deferred until all components are installed (per the user):** export the old Redash instance's dashboards/queries and import them into this new one — same pattern as the Keycloak realm export/import in Phase 3.3. Not yet started.
 
 ### 3.9 forms-flow-bpm (vanilla — no custom Java extensions per plan decision)
 
