@@ -19,7 +19,7 @@
 - Porting the custom Camunda Java extensions (Keycloak service-account token class, Redis-backed real-time task-event websocket push, `ApplicationAccessHandler`) currently in the v4.0.8 `forms-flow-bpm` overlay, **unless** the "Camunda/API may need customizations" question above resolves to include this — TBD, don't assume either way yet. Absent that, this install uses vanilla EE `forms-flow-bpm` — real-time task-list updates will not work; users see stock poll/refresh behavior until a follow-up project ports that code forward.
 - Porting the custom `ServiceFlow` React UI (task list/filters) built against the old monolithic `forms-flow-web` — incompatible with the microfrontend architecture. Concrete, possibly citizen-facing gap: the `REACT_APP_PUBLIC_FORM_ID`/`DOCUMENT_TYPES`-driven public NCQ document-serving flow has no equivalent in the stock web chart. **Confirm with the team before a prod cutover** whether this needs to be resolved first.
 - `forms-flow-mcp` — skipped this pass; add later if needed.
-- ~~`forms-flow-documents-api`, `forms-flow-analytics`~~ — **now in scope** as of the 2026-08-17 EE pivot (see Phase 3 additions below). `forms-flow-data-analysis-api` remains out of scope (not requested). `forms-flow-data-layer` was also brought into scope on 2026-08-17 but **skipped on investigation 2026-08-18** — see Phase 3.6: it's infrastructure for external GraphQL consumers, and nothing in this stack (or ServeLegal's own code) actually consumes it.
+- ~~`forms-flow-analytics`~~ — **now in scope** as of the 2026-08-17 EE pivot (see Phase 3 additions below). `forms-flow-data-analysis-api` remains out of scope (not requested). `forms-flow-data-layer` and `forms-flow-documents-api` were also brought into scope on 2026-08-17 but **both skipped 2026-08-18**: `forms-flow-data-layer` (see Phase 3.6) is infrastructure for external GraphQL consumers with no consumer found anywhere in this stack or ServeLegal's own code; `forms-flow-documents-api` (see Phase 3.7) generates server-side PDFs from form submissions, a capability the customer doesn't need right now (revisit if explicitly requested).
 
 ---
 
@@ -320,7 +320,7 @@ helm repo update
 
 ## Phase 3 — Ordered `helm upgrade --install`
 
-Deployment order (dependency-correct, matches the chart repo's own documented order and the validated `deploy-stack.sh`, extended with the 2026-08-17 EE scope additions): `forms-flow-ai` (infra shell) → `forms-flow-servebc-config` → `forms-flow-idm` (Keycloak) → `forms-flow-forms` (Form.io) → `forms-flow-api` (webapi) → ~~`forms-flow-data-layer`~~ (**skipped 2026-08-18, see 3.6 — unused, no consumer found anywhere in this stack**) → `forms-flow-documents-api` → `forms-flow-analytics` → `forms-flow-bpm` (Camunda) → `servebc-api` (custom API) → `forms-flow-web`. The remaining new components land right after `forms-flow-api` since each depends on api/forms/idm already being up (documents-api directly references their secrets/config; analytics is more loosely coupled but keeping the order consistent costs nothing).
+Deployment order (dependency-correct, matches the chart repo's own documented order and the validated `deploy-stack.sh`, extended with the 2026-08-17 EE scope additions): `forms-flow-ai` (infra shell) → `forms-flow-servebc-config` → `forms-flow-idm` (Keycloak) → `forms-flow-forms` (Form.io) → `forms-flow-api` (webapi) → ~~`forms-flow-data-layer`~~ (**skipped 2026-08-18, see 3.6 — unused, no consumer found anywhere in this stack**) → ~~`forms-flow-documents-api`~~ (**skipped 2026-08-18, see 3.7 — server-side PDF generation not needed by the customer**) → `forms-flow-analytics` → `forms-flow-bpm` (Camunda) → `servebc-api` (custom API) → `forms-flow-web`. The remaining new component (`forms-flow-analytics`) lands right after `forms-flow-api` in the order since it's loosely coupled but keeping the sequence consistent costs nothing.
 
 **Decision, confirmed with the user: Postgres via existing Patroni, not the chart's bundled Bitnami `postgresql-ha`.** Bitnami's `postgresql-ha`/`mongodb` images moved to the frozen/unpatched `bitnamilegacy` catalog (Aug 2025) — a real "blocks prod sign-off" problem the original draft of this runbook flagged. Patroni is already running, already BC-Gov-approved in this namespace, and architecturally simpler (DCS-based leader election, no separate pgpool routing tier) than repmgr+pgpool — reusing it sidesteps the Bitnami problem entirely rather than trading one HA technology for an equivalently-good one with a licensing/staleness catch. Mongo: no existing HA alternative, so reuse the existing single-instance `formio-mongodb-dev` rather than adding a second frozen-image dependency (the current v4.0.8 stack already runs this way with no reported issues).
 
@@ -684,10 +684,11 @@ helm upgrade --install forms-flow-data-layer ./charts/forms-flow-data-layer \
 ```
 `formsflow.webapi.secret` points at the Phase 1.3 consolidated secret, not a `forms-flow-api`-named one — `forms-flow-data-layer` hardcodes the exact key names it looks for (`FORMSFLOW_API_HOSTNAME`/`FORMSFLOW_API_DB_NAME`/`FORMSFLOW_API_DB_USER`/`FORMSFLOW_API_DB_PASSWORD`, no override mechanism). **Not fully traced before abandoning**: the `secret "forms-flow-bpm" not found` `CreateContainerConfigError` — this chart apparently also expects a `forms-flow-bpm`-named secret from somewhere, undocumented in the values.yaml paths checked so far; would need investigation if this component is revisited.
 
-### 3.7 forms-flow-documents-api (EE scope addition — stateless, no new database)
+### 3.7 forms-flow-documents-api — SKIPPED for this pass (2026-08-18)
 
-Build locally per the Phase 3.1 pattern (`<component>` = `forms-flow-documents`, matching the EE repo's directory name — note this differs from the chart/release name `forms-flow-documents-api`) — no registry key yet, small/fast build.
+**Decision (user's call): not installing this component.** Confirmed its purpose before deciding — its own `Chart.yaml` description: *"forms-flow-documents-api is to generate pdf with form submission data."* Server-side PDF/document generation isn't a capability the customer needs right now. **Revisit if this integration is explicitly requested by the customer** — same "skip, don't silently drop" treatment as `forms-flow-data-layer` in Phase 3.6. Never attempted an install, so nothing was deployed and nothing needs cleanup.
 
+**Old command, kept for reference only if this is ever revisited:**
 ```bash
 helm upgrade --install forms-flow-documents-api ./charts/forms-flow-documents-api \
   --namespace "$NS" \
@@ -697,8 +698,7 @@ helm upgrade --install forms-flow-documents-api ./charts/forms-flow-documents-ap
   --set ingress.hostname="forms-flow-documents-${NS}.${DOMAIN}" \
   --set ingress.tls=true
 ```
-
-> Check `charts/forms-flow-documents-api/values.yaml` for how `FORMIO_URL`/`FORMSFLOW_API_URL`/`REDIS_URL`/`KEYCLOAK_URL_HTTP_RELATIVE_PATH` are wired (configmap references similar to `forms-flow-data-layer` above) before running — not fully traced during planning.
+(Build locally per the Phase 3.1 pattern — `<component>` = `forms-flow-documents`, matching the EE repo's directory name, note this differs from the chart/release name `forms-flow-documents-api`. Not fully traced before abandoning: check `charts/forms-flow-documents-api/values.yaml` for how `FORMIO_URL`/`FORMSFLOW_API_URL`/`REDIS_URL`/`KEYCLOAK_URL_HTTP_RELATIVE_PATH` are wired, and apply the by-now-established collision/TLS-selfSigned/cross-namespace-pull-secret checklist from Phases 3.4–3.5.)
 
 ### 3.8 forms-flow-analytics (EE scope addition — new `analyticsdb${DB_SUFFIX}` from Phase 1.4, shared Redis)
 
@@ -813,9 +813,7 @@ curl -sk -o /dev/null -w "forms-flow-forms -> HTTP %{http_code}\n" "https://form
 curl -sk -o /dev/null -w "forms-flow-api -> HTTP %{http_code}\n" "https://forms-flow-api-${NS}.${DOMAIN}/"
 
 # forms-flow-data-layer skipped (see Phase 3.6) — nothing to verify
-
-# forms-flow-documents-api
-curl -sk -o /dev/null -w "forms-flow-documents-api -> HTTP %{http_code}\n" "https://forms-flow-documents-${NS}.${DOMAIN}/"
+# forms-flow-documents-api skipped (see Phase 3.7) — nothing to verify
 
 # forms-flow-analytics
 curl -sk -o /dev/null -w "forms-flow-analytics -> HTTP %{http_code}\n" "https://forms-flow-analytics-${NS}.${DOMAIN}/"
@@ -845,7 +843,7 @@ helm rollback <release> <revision> -n "$NS"
 ```
 Full teardown of a bad install (reverse deployment order):
 ```bash
-for chart in forms-flow-web servebc-api forms-flow-bpm forms-flow-analytics forms-flow-documents-api forms-flow-api forms-flow-forms forms-flow-idm forms-flow-servebc-config forms-flow-ai; do
+for chart in forms-flow-web servebc-api forms-flow-bpm forms-flow-analytics forms-flow-api forms-flow-forms forms-flow-idm forms-flow-servebc-config forms-flow-ai; do
   helm uninstall "$chart" -n "$NS"
 done
 ```
