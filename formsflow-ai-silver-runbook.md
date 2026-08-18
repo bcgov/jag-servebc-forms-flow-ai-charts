@@ -430,16 +430,22 @@ rm -f /tmp/ches-vals.env /tmp/s3-vals.env
 
 Confirmed decision (2026-08-11): keep this self-hosted rather than switching to OCIO's shared BC Gov realm — OCIO's shared realm doesn't expose the custom role-mapping (`designer`/`reviewer`/`client`) formsflow.ai needs, and a custom realm inside OCIO would need project-level approvals/audits that take time (may be pursued separately later). This install is a parallel/side-by-side stand-up, not an in-place upgrade of the old 18.0.2-legacy instance — new release, new route, new DB, new realm rebuilt via API. **Known risk, not yet resolved:** the Bitnami `keycloak` subchart here pulls from the frozen/unpatched `bitnamilegacy/keycloak:26.1.4-debian-12-r2` catalog — same class of problem as the Postgres/Mongo Bitnami issue below, but with no workaround planned yet. Fine for `dev`; decide (pin a patched image, or accept the risk) before `test`/`prod`.
 
+**⚠️ Two real bugs found and fixed running this step for `dev` (2026-08-17) — both needed before the install actually works:**
+
+1. **Wrong toggle for the bundled Postgres.** `keycloak.postgresql.enabled=false` (as originally drafted here) does nothing — this chart's bundled Bitnami Postgres is declared as a **top-level** dependency (`postgresql-ha`, gated by `condition: postgresql-ha.enabled` in `charts/forms-flow-idm/Chart.yaml`), not nested under `keycloak.*`. Confirmed live: the first install attempt with the old `--set` silently deployed a full `forms-flow-idm-postgresql-postgresql` StatefulSet + `pgpool` Deployment (`bitnamilegacy/pgpool` image) anyway, which then hit the same storage-quota wall as Phase 0 flagged (`8Gi` request against an already ~91%-full storage class — the PVC creation failed, so no actual storage was wasted, but the pgpool pod itself ran needlessly). **Fix: use the top-level `--set postgresql-ha.enabled=false`**, same pattern as Phase 3.1 — this is exactly the "check the rendered manifest, don't assume the toggle nesting" warning already in Phase 3.1's note, now confirmed to bite for real.
+2. **Hardcoded `runAsUser: 1001` on a custom init container breaks OpenShift's SCC.** `charts/forms-flow-idm/values.yaml`'s `keycloak.initContainers` includes a custom `formsflow-themes` container (pulls `formsflow/keycloak-customizations:v7.3.0` to seed themes/providers/realm-import files) with `securityContext.runAsUser: 1001` hardcoded. OpenShift's `restricted`/`restricted-v2` SCC only allows this namespace's assigned UID range (confirmed error: `runAsUser: Invalid value: 1001: must be in the ranges: [1011120000, 1011129999]`), so the Keycloak StatefulSet couldn't schedule at all — `0/1` forever, no SCC matched. The chart's *main* Keycloak container already does this correctly (`containerSecurityContext.enabled: false` / `podSecurityContext.enabled: false`, letting OpenShift auto-assign); this one custom init container just didn't follow that pattern. **Fix: `deploy-overrides/forms-flow-idm-overrides.yaml`** (now in this repo) re-specifies the same `formsflow-themes` init container with `securityContext` dropped entirely, passed via `-f` below. **Don't try to patch just the `securityContext` field with `--set`/`--set-json`** — confirmed live that targeting a single field of an existing array element via `--set-json 'keycloak.initContainers[0].securityContext={}'` silently wiped every *other* field of that same array element (`name`/`image`/`command`/`args`/`volumeMounts` all disappeared from the rendered manifest, verified via `helm template`) — a known Helm gotcha with `--set` on array indices, not a chart bug. A full values-override file avoids it.
+
 ```bash
 KEYCLOAK_ADMIN_PASS=$(openssl rand -base64 24)
 
 helm upgrade --install forms-flow-idm ./charts/forms-flow-idm \
+  -f deploy-overrides/forms-flow-idm-overrides.yaml \
   --namespace "$NS" \
   --set keycloak.ingress.hostname="forms-flow-idm-${NS}.${DOMAIN}" \
   --set keycloak.ingress.tls=true \
   --set keycloak.auth.adminUser=admin \
   --set keycloak.auth.adminPassword="$KEYCLOAK_ADMIN_PASS" \
-  --set keycloak.postgresql.enabled=false \
+  --set postgresql-ha.enabled=false \
   --set keycloak.externalDatabase.existingSecret=formsflow-db-82 \
   --set keycloak.externalDatabase.existingSecretHostKey=KEYCLOAK_DB_HOST \
   --set keycloak.externalDatabase.existingSecretPortKey=KEYCLOAK_DB_PORT \
@@ -447,9 +453,17 @@ helm upgrade --install forms-flow-idm ./charts/forms-flow-idm \
   --set keycloak.externalDatabase.existingSecretDatabaseKey=KEYCLOAK_DB_NAME \
   --set keycloak.externalDatabase.existingSecretPasswordKey=KEYCLOAK_DB_PASSWORD
 
+# Persist the admin credential durably (same lesson as the Mongo $FORMIO_DB_PASS loss earlier) —
+# don't rely on the shell variable surviving to the next session.
+oc create secret generic formsflow-admin-secrets-82 -n "$NS" \
+  --from-literal=KEYCLOAK_ADMIN_USER=admin \
+  --from-literal=KEYCLOAK_ADMIN_PASSWORD="$KEYCLOAK_ADMIN_PASS"
+
 oc wait --namespace "$NS" --for=condition=ready pod \
   --selector=app.kubernetes.io/name=keycloak --timeout=300s
 ```
+
+Confirmed working end-to-end for `dev` 2026-08-17: Keycloak pod `1/1 Running`, route reachable (`curl .../auth/realms/master/.well-known/openid-configuration` → `HTTP 200`), no bundled-Postgres resources left behind (Helm pruned the StatefulSet/Deployment created by the first, broken attempt once `postgresql-ha.enabled=false` was set correctly on the follow-up `helm upgrade`).
 
 **Realm rebuild** (fresh-install scope — recreate the structure from the old realm as a template, not a raw DB migration; reference: this session's `openshift-export/CURRENT-CONFIG-a60371-dev.md` for the exact structure being replicated):
 
