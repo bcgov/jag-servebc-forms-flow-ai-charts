@@ -338,6 +338,17 @@ done
 
 Deleting a Secret doesn't crash already-running old-stack pods (env vars were injected into the container at start and aren't re-read live) — it only means those DCs can't cleanly restart until cutover replaces them, which is expected and acceptable given the decision above. **For `test`/`prod`: re-run the same collision check** (`oc get secret <release-name> -n "$NS"` for each of the six names above) **and re-verify the backup is current before deleting** — don't assume the `dev` outcome (safe to delete) applies without checking.
 
+**⚠️ The same collision also exists for Service and Route objects — missed in the check above, found while installing `forms-flow-forms` (Phase 3.4, 2026-08-18).** The original collision check only covered Secrets and ConfigMaps; charts also create a Service (and, via their Ingress, an OpenShift Route) named after the release, and the old stack has those too: `forms-flow-forms`, `forms-flow-analytics`, `forms-flow-bpm`, `forms-flow-web` all collided (`forms-flow-api`/`forms-flow-data-layer`/`forms-flow-documents-api`/`servebc-api` did not — no legacy Service/Route at those exact names). Same fix, same reasoning as the Secrets above — both already covered by the existing 2026-08-06 export (`services-all.yaml`/`routes-all.yaml`):
+```bash
+for r in forms-flow-forms forms-flow-analytics forms-flow-bpm forms-flow-web; do
+  oc delete service "$r" -n "$NS"
+  oc delete route "$r" -n "$NS"
+done
+```
+**Re-run this same 4-kind check (Secret/ConfigMap/Service/Route) against every release name before each phase from here on** — don't assume Phase 3.4's discovery means everything's now clean; not all remaining releases have been checked yet.
+
+**⚠️ zsh gotcha that caused this to be missed the first time, worth remembering for any future scripting in this runbook:** `for r in $SOME_VAR; do ... done` does **not** word-split an unquoted variable in zsh (unlike bash) — the whole space-separated string gets treated as one literal token. A collision-scan loop built this way silently checked for a resource literally named `"forms-flow-forms forms-flow-api forms-flow-..."` (with spaces, obviously never found) instead of iterating each name — no error, just silent false negatives. Either use a real zsh array (`RELEASES=(a b c)` / `for r in "${RELEASES[@]}"`) when building a list from a variable, or write the list directly as literal words in the `for` statement (`for r in a b c; do`, which parses as separate tokens regardless of shell) rather than through an intermediate variable.
+
 ### 3.1 forms-flow-ai (infra shell — Redis only; Postgres/Mongo externalized)
 
 ```bash
@@ -526,9 +537,18 @@ oc patch secret formsflow-admin-secrets-82 -n "$NS" --type=merge -p \
 
 ### 3.4 forms-flow-forms (Form.io)
 
-**⚠️ Check before running this step:** `formio-mongodb-dev` is running MongoDB 3.6.3 (confirmed in Phase 1.2). Modern MongoDB Node.js drivers refuse to connect to anything below 4.2 — that's exactly what broke `mongosh` during Phase 1.2. Check what driver version ships in the EE `forms-flow-forms` image before running this install; if it has the same floor, this step is blocked until either the driver is downgraded (unlikely, upstream-controlled) or `formio-mongodb-dev` is upgraded past 3.6 first (separate, unscoped work).
+**Status for `dev`: done, 2026-08-18.** Mongo driver-compat risk checked and cleared, real image choice made, and two more real bugs found (Service/Route collision — see the Phase 3 intro note above — and a TLS/Ingress gap affecting every component from here on). Detail below.
 
-**Image choice:** unlike the five components using the local-build pattern (Phase 3.1), this chart's default image is `docker.io/formsflow/forms-flow-forms:v7.3.0` — a **public**, OSS-tagged image, no registry key or local build needed. Fine to use as-is if EE-specific forms features aren't needed yet; otherwise the EE repo has its own `openshift_custom_Dockerfile` for this component if you want to build the EE version locally instead, same pattern as the others.
+**Mongo driver-compat risk — checked, not a blocker.** Pulled the actual `docker.io/formsflow/forms-flow-forms:v7.3.0` image's dependency versions directly (`oc run ... --command -- cat node_modules/mongodb/package.json`): `mongodb` driver `4.17.2`, `mongoose` `6.12.3`. MongoDB's official Node driver compatibility matrix supports server versions 3.6–6.0 for driver v4.x — `formio-mongodb-dev` (3.6.3) is within that range. The earlier `mongosh` failure in Phase 1.2 was that specific interactive-shell tool's own stricter, hardcoded ≥4.2 requirement — unrelated to what the underlying driver protocol actually supports. Confirmed live: connects and bootstraps cleanly (see below).
+
+**Image choice: public `v7.3.0`, not an EE local build.** Checked the EE repo's `forms-flow-forms/` directory before deciding — it has **no `package.json` at all**; its `openshift_custom_Dockerfile` just `git clone`s a separately-configured `${FORMIO_SOURCE_REPO_URL}`/`${FORMIO_SOURCE_REPO_BRANCH}` (build args, not specified anywhere in this checkout) onto a **Node 12** base image. Murkier and less proven than the known-good, already-inspected public image — used the chart's default (`docker.io/formsflow/forms-flow-forms:v7.3.0`) instead.
+
+**⚠️ `formio-mongodb-dev` must be scaled up and left running from this point on — it's a real runtime dependency now, not just an admin-task target.** Earlier phases (1.2, and ad-hoc admin checks) scaled it 0→1→0 as a temporary measure since nothing depended on it continuously. Once `forms-flow-forms` (and later `forms-flow-data-layer`) are actually deployed, they hold an open connection to it — first install attempt without this crashed with `MongoServerSelectionError: connect ECONNREFUSED` (connection string was correct — this just confirmed the earlier `NODE_CONFIG` wiring fix from Phase 3.1 works — the instance simply wasn't running).
+```bash
+oc scale dc/formio-mongodb-dev -n "$NS" --replicas=1
+oc rollout status dc/formio-mongodb-dev -n "$NS" --timeout=120s
+# Leave at replicas=1 from here on — do NOT scale back to 0 after this step, unlike Phase 1.2/admin tasks.
+```
 
 ```bash
 FORMIO_ROOT_PASS=$(openssl rand -base64 20)
@@ -538,12 +558,31 @@ helm upgrade --install forms-flow-forms ./charts/forms-flow-forms \
   --namespace "$NS" \
   --set ingress.hostname="forms-flow-forms-${NS}.${DOMAIN}" \
   --set ingress.tls=true \
+  --set ingress.selfSigned=true \
   --set admin.email="<team-email>" \
   --set admin.password="$FORMIO_ROOT_PASS" \
   --set jwt.secret="$FORMIO_JWT_SECRET"
+
+# Persist durably immediately — same lesson as every other generated credential this pass.
+oc create secret generic formsflow-forms-admin-82 -n "$NS" \
+  --from-literal=FORMIO_ROOT_EMAIL="<team-email>" \
+  --from-literal=FORMIO_ROOT_PASSWORD="$FORMIO_ROOT_PASS" \
+  --from-literal=FORMIO_JWT_SECRET="$FORMIO_JWT_SECRET"
 ```
 
-**No Mongo `--set` needed here — fixed 2026-08-17, was a real bug in the original draft.** `charts/forms-flow-forms/values.yaml` has **no `mongodb.uri` value path at all** (grepped the whole file for "mongo", zero matches) — the line that used to be here did nothing. This chart actually reads `NODE_CONFIG` via `secretKeyRef` from whatever secret `.Values.formsflow.secret` points at, which defaults to `forms-flow-ai` — the same central secret Phase 3.1 populates. As long as Phase 3.1's `mongodb.auth.*`/`mongodb.service.*` values are set correctly (see the warning box there), `NODE_CONFIG` already has the right Mongo connection string by the time this step runs, automatically, for this chart and anything else reading `formsflow.secret` (e.g. `forms-flow-data-layer`'s `FORMIO_DB_URI`). Verify explicitly in Phase 4 rather than assuming — this class of bug (wrong value, no install-time error) only shows up as a runtime connection failure.
+**No Mongo `--set` needed here — fixed 2026-08-17, was a real bug in the original draft.** `charts/forms-flow-forms/values.yaml` has **no `mongodb.uri` value path at all** (grepped the whole file for "mongo", zero matches) — the line that used to be here did nothing. This chart actually reads `NODE_CONFIG` via `secretKeyRef` from whatever secret `.Values.formsflow.secret` points at, which defaults to `forms-flow-ai` — the same central secret Phase 3.1 populates. As long as Phase 3.1's `mongodb.auth.*`/`mongodb.service.*` values are set correctly (see the warning box there), `NODE_CONFIG` already has the right Mongo connection string by the time this step runs, automatically, for this chart and anything else reading `formsflow.secret` (e.g. `forms-flow-data-layer`'s `FORMIO_DB_URI`). Verify explicitly in Phase 4 rather than assuming — this class of bug (wrong value, no install-time error) only shows up as a runtime connection failure. **Confirmed working live 2026-08-18** — pod logs show `Opening new connection to mongodb://formiouser:...@formio-mongodb-dev:27017/formio_82`, followed by a full template/role/admin bootstrap and `Serving the Form.io API Platform`.
+
+**⚠️ `ingress.tls=true` alone renders no TLS at all in this chart (and likely others sharing this template) — a real, universal gap found here, applies to every remaining Ingress-based component below.** This chart's `templates/ingress.yaml` only renders a `tls:` block when `ingress.tls=true` **AND** one of: a cert-manager annotation, `ingress.secrets`, or `ingress.selfSigned` is *also* set — `ingress.tls=true` on its own (as originally drafted, and as still used for `forms-flow-idm`'s Keycloak in Phase 3.3) silently produces an Ingress with no `tls:` section at all. OpenShift's Ingress→Route controller then creates an **HTTP-only** Route (no `spec.tls`), and HTTPS requests to that host get the router's generic 503 "Application is not available" page — looks exactly like a broken app, but the app and its HTTP endpoint are both actually fine (`curl http://...` returned 200 the whole time). Confirmed via `helm template` dry-run before/after: adding `--set ingress.selfSigned=true` (added above) makes the `tls:` block render.
+
+**`ingress.selfSigned=true` changes the template condition, but does not itself create the referenced cert/secret** — the Ingress ends up with `tls: - hosts: [...] secretName: <hostname>-tls`, referencing a secret that doesn't exist yet. Unlike Keycloak's case (whose ingress template renders a *bare empty* `tls: [{}]` with no `secretName`, which OpenShift's route-generator treats as "edge-terminate with the router's own default cert, no secret needed"), a `tls:` entry that names a **specific, missing** secret makes the route-generator skip creating a Route at all rather than falling back to a default — confirmed live: after adding `selfSigned=true` alone, `oc get route` for this release returned nothing, and the Ingress's `status.loadBalancer` went empty. **Fix: manually create that exact self-signed TLS secret** — cheap, one-time per hostname, works because OpenShift's edge termination is happy with any valid cert/key pair, not specifically a CA-signed one:
+```bash
+HOST="forms-flow-forms-${NS}.${DOMAIN}"
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+  -keyout /tmp/selfsigned.key -out /tmp/selfsigned.crt -subj "/CN=${HOST}"
+oc create secret tls "${HOST}-tls" -n "$NS" --cert=/tmp/selfsigned.crt --key=/tmp/selfsigned.key
+rm -f /tmp/selfsigned.key /tmp/selfsigned.crt
+```
+Run this (with the right `$HOST` for that component) for **every remaining Ingress-based chart below** (`forms-flow-api`, `forms-flow-documents-api`, `forms-flow-analytics`, `forms-flow-bpm`, `servebc-api`, `forms-flow-web` — check `forms-flow-data-layer` too, though earlier notes say it has no public route by default) — add `--set ingress.selfSigned=true` alongside `--set ingress.tls=true` in each chart's own install command, and create the matching `<hostname>-tls` secret either just before or just after that `helm upgrade --install`. Confirmed working end-to-end for `forms-flow-forms`: route shows `TERMINATION: edge/Redirect`, `curl -sk https://.../formio/` → `HTTP 200`.
 
 ### 3.5 forms-flow-api (webapi)
 
