@@ -1,0 +1,9 @@
+apiVersion: v2
+name: forms-flow-servebc-config
+description: >-
+  Centralized configuration (ConfigMap + Secret) for the ServeBC integration —
+  CHES email service, S3/object storage, and the servebc Postgres database.
+  Referenced by servebc-api and forms-flow-bpm across their own releases.
+version: v1.0.0
+type: application
+appVersion: "v1.0.0"

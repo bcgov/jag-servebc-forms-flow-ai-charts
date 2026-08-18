@@ -1,0 +1,220 @@
+replicaCount: 1
+image:
+  registry: docker.io
+  repository: bcgov/servebc-api
+  pullPolicy: Always
+  tag: "v1.1.0"
+  pullSecrets:
+    - forms-flow-ai-auth
+
+## @param nameOverride String to partially override common.names.fullname
+nameOverride: ""
+## @param fullnameOverride String to fully override common.names.fullname
+fullnameOverride: ""
+## @param commonLabels Labels to add to all deployed objects
+commonLabels: {}
+## @param commonAnnotations Annotations to add to all deployed objects
+commonAnnotations: {}
+
+tolerations: []
+nodeSelector: {}
+affinity: {}
+priorityClassName: ""
+schedulerName: ""
+terminationGracePeriodSeconds: ""
+topologySpreadConstraints: []
+
+diagnosticMode:
+  enabled: false
+  command:
+    - sleep
+  args:
+    - infinity
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+  automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+podAffinityPreset: ""
+podAntiAffinityPreset: soft
+nodeAffinityPreset:
+  type: ""
+  key: ""
+  values: []
+
+podSecurityContext:
+  enabled: false
+  fsGroupChangePolicy: Always
+  sysctls: []
+  supplementalGroups: []
+  fsGroup: 1001
+
+containerSecurityContext:
+  enabled: false
+  seLinuxOptions: {}
+  runAsUser: 1001
+  runAsGroup: 1001
+  runAsNonRoot: false
+  privileged: false
+  readOnlyRootFilesystem: false
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: "RuntimeDefault"
+
+command: []
+args: []
+lifecycleHooks: {}
+automountServiceAccountToken: true
+
+extraEnvVars: []
+extraEnvVarsCM: ""
+extraVolumes: {}
+extraVolumeMounts: {}
+sidecars: {}
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 25%
+    maxUnavailable: 25%
+
+ingress:
+  enabled: true
+  ingressClassName: ""
+  pathType: ImplementationSpecific
+  apiVersion: ""
+  controller: default
+  hostname: servebc-api.local
+  path: "/"
+  servicePort: 3003
+  annotations: {}
+  labels: {}
+  tls: false
+  selfSigned: false
+  extraHosts: []
+  extraPaths: []
+  extraTls: []
+  secrets: []
+  extraRules: []
+
+pdb:
+  create: true
+  minAvailable: ""
+  maxUnavailable: ""
+
+resourcesPreset: "small"
+resources:
+  limits:
+    cpu: 300m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+customStartupProbe: {}
+customLivenessProbe: {}
+customReadinessProbe: {}
+
+service:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3003
+      targetPort: http
+      protocol: TCP
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+  clusterIP: ""
+  annotations: {}
+  sessionAffinity: None
+  sessionAffinityConfig: {}
+  headless:
+    annotations: {}
+
+configuration: []
+
+containerPorts:
+  http: 3003
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 11
+  targetCPU: ""
+  targetMemory: ""
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies: []
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+
+# Database connection — set DB_USE_POSTGRES=true to use the shared postgres-ha instance.
+# Add the database to forms-flow-ai initdbScripts before deploying:
+#   servebc_db_init.sh: |
+#     psql -U postgres -c "CREATE DATABASE \"servebc\" OWNER postgres;"
+# NOTE: the servebc-api container itself now gets its DB/S3 env vars from the external
+# forms-flow-servebc ConfigMap/Secret (see formsflow.servebcConfigmap/servebcSecret below).
+# This local `database`/`s3` block is only used by the one-time db-init Job below, which runs
+# as a pre-install/pre-upgrade hook and can't depend on that other chart's Secret existing yet.
+# Keep both copies in sync when changing credentials.
+database:
+  username: "postgres"
+  password: "postgres"
+  dbName: "servebc"
+  host: "forms-flow-ai-postgresql-ha-pgpool"
+  port: 5432
+  usePostgres: true
+  initJob:
+    enabled: true
+    image: "docker.io/bitnamilegacy/postgresql-repmgr:17.5.0-debian-12-r10"
+
+ExternalDatabase:
+  ExistingDatabaseNameKey: ""
+  ExistingDatabaseUserNameKey: ""
+  ExistingDatabasePasswordKey: ""
+  ExistingDatabaseHostKey: ""
+  ExistingDatabasePortKey: ""
+  ExistingSecretName: ""
+  ExistingConfigmapName: ""
+
+nodeEnv: "production"
+logLevel: "info"
+
+# CORS allowed origins — comma-separated list or "*" for all
+corsOrigin: "*"
+
+formsflow:
+  configmap: forms-flow-ai
+  secret: forms-flow-ai
+  # name of the forms-flow-servebc-config chart's ConfigMap/Secret (S3_*/DB app-runtime keys)
+  servebcConfigmap: forms-flow-servebc
+  servebcSecret: forms-flow-servebc
+
+## Routes this hostname to the ingress-nginx-controller's ClusterIP instead of
+## the pod's own loopback (nip.io always resolves *.127.0.0.1.nip.io to
+## 127.0.0.1, which inside a pod means the pod itself, not the cluster's
+## ingress). Without this, servebc-api can never reach Keycloak to validate
+## tokens — every request gets rejected with a generic 403 "Access denied"
+## and no useful error in the logs (keycloak-connect swallows the real
+## connection error). Same IP used by forms-flow-bpm/api/documents-api's
+## hostAliases — if ingress-nginx-controller's Service is ever recreated,
+## this IP may change and need updating everywhere it's hardcoded.
+hostAliases:
+  - ip: "10.97.41.84"
+    hostnames:
+      - "forms-flow-idm-formsflow.127.0.0.1.nip.io"
+      - "forms-flow-web-formsflow.127.0.0.1.nip.io"

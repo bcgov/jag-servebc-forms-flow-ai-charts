@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: forms-flow-servebc
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    app.kubernetes.io/name: forms-flow-servebc-config
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+data:
+  EMAIL_KEYCLOAK_URL: {{ .Values.ches.keycloakUrl | quote }}
+  EMAIL_SVC_URL: {{ .Values.ches.serviceUrl | quote }}
+  TZ: {{ .Values.bpm.timezone | quote }}
+  SERVEDOCUMENT_API_BASE_URL: {{ .Values.servebc.internalUrl | quote }}
+  SERVEDOCUMENT_API_EXTERNAL_URL: {{ .Values.servebc.externalUrl | quote }}
+  CUSTOM_THEME_URL: {{ .Values.web.customThemeUrl | quote }}
+  DB_PORT: {{ .Values.database.port | quote }}
+  DB_USE_POSTGRES: {{ .Values.database.usePostgres | quote }}
+  S3_BUCKETNAME: {{ .Values.s3.bucketName | quote }}
+  S3_HOST: {{ .Values.s3.host | quote }}
+  S3_USE_SSL: {{ .Values.s3.useSsl | quote }}

@@ -1,0 +1,13 @@
+apiVersion: v2
+name: servebc-api
+description: servebc-api is a Node.js REST API providing additional functionality on top of formsflow.ai for the ServeBC project.
+icon: "https://raw.githubusercontent.com/AOT-Technologies/forms-flow-ai/develop/.images/logo.png"
+version: v1.1.0
+type: application
+appVersion: "v1.1.0"
+dependencies:
+- name: common
+  repository: https://charts.bitnami.com/bitnami
+  tags:
+  - bitnami-common
+  version: 2.27.0

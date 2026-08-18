@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "common.names.fullname" . }}-keycloak
+  namespace: {{ include "common.names.namespace" . | quote }}
+  labels: {{- include "common.labels.standard" ( dict "customLabels" .Values.commonLabels "context" $ ) | nindent 4 }}
+    app.kubernetes.io/component: servebc-api
+  {{- if .Values.commonAnnotations }}
+  annotations: {{- include "common.tplvalues.render" ( dict "value" .Values.commonAnnotations "context" $ ) | nindent 4 }}
+  {{- end }}
+data:
+  keycloak.json: |
+    {
+      "realm": "${env.KEYCLOAK_REALM}",
+      "auth-server-url": "${env.KEYCLOAK_AUTH_SERVER_URL}",
+      "ssl-required": "external",
+      "resource": "${env.KEYCLOAK_CLIENT_ID}",
+      "bearer-only": true,
+      "verify-token-audience": true,
+      "use-resource-role-mappings": true,
+      "confidential-port": 0
+    }
