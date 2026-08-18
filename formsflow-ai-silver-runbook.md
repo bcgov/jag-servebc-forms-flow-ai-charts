@@ -359,9 +359,18 @@ FORMIO_DB_NAME=$(oc get secret formsflow-db-82 -n "$NS" -o jsonpath='{.data.FORM
 FORMIO_DB_USER=$(oc get secret formsflow-db-82 -n "$NS" -o jsonpath='{.data.FORMIO_DB_USER}' | base64 -d)
 FORMIO_DB_PASS=$(oc get secret formsflow-db-82 -n "$NS" -o jsonpath='{.data.FORMIO_DB_PASSWORD}' | base64 -d)
 
+# Generate the Form.io root admin credential HERE, once, and reuse it identically in Phase 3.4's
+# forms-flow-forms install below — see the "FORMIO_ROOT credential mismatch" warning further down
+# for why this must be the same value in both places, not independently generated per chart.
+FORMIO_ROOT_EMAIL="<team-email>"
+FORMIO_ROOT_PASS=$(openssl rand -base64 20)
+oc create secret generic formsflow-forms-admin-82 -n "$NS" \
+  --from-literal=FORMIO_ROOT_EMAIL="$FORMIO_ROOT_EMAIL" \
+  --from-literal=FORMIO_ROOT_PASSWORD="$FORMIO_ROOT_PASS"
+
 helm upgrade --install forms-flow-ai ./charts/forms-flow-ai \
   --namespace "$NS" \
-  --set Domain="${NS}.${DOMAIN}" \
+  --set Domain="${DOMAIN}" \
   --set postgresql-ha.enabled=false \
   --set mongodb.enabled=false \
   --set mongodb.auth.usernames[0]="$FORMIO_DB_USER" \
@@ -369,7 +378,9 @@ helm upgrade --install forms-flow-ai ./charts/forms-flow-ai \
   --set mongodb.auth.databases[0]="$FORMIO_DB_NAME" \
   --set mongodb.service.nameOverride=formio-mongodb-dev \
   --set mongodb.service.ports.mongodb=27017 \
-  --set redisExporter.persistence.storageClass=netapp-block-standard
+  --set redisExporter.persistence.storageClass=netapp-block-standard \
+  --set "forms-flow-forms.admin.email=$FORMIO_ROOT_EMAIL" \
+  --set "forms-flow-forms.admin.password=$FORMIO_ROOT_PASS"
 
 # Wait for Redis (the one piece of infra this chart still owns)
 oc wait --namespace "$NS" --for=condition=ready pod \
@@ -377,6 +388,10 @@ oc wait --namespace "$NS" --for=condition=ready pod \
 ```
 
 `redisExporter.persistence.storageClass` routes the new Redis PVC to `netapp-block-standard` instead of the default `netapp-file-standard` — per Phase 0, the default class is ~89% full in `dev`; this is the only PVC any Phase 3 chart creates (confirmed by grepping every chart's templates for `PersistentVolumeClaim`/`VolumeClaimTemplate`), so this one `--set` clears the storage-quota risk entirely. `ingress.ingressClassName` is intentionally omitted from every `--set` in this phase (not just here) — see the Phase 0 note above.
+
+**⚠️ `Domain` must be the bare domain (`apps.silver.devops.gov.bc.ca`), not namespace-prefixed — a real bug found running Phase 3.5, root-caused back here.** The original draft passed `Domain="${NS}.${DOMAIN}"` (namespace-prefixed). This chart's own `values.yaml` builds several shared config values (`KEYCLOAK_URL` and friends, `FORMIO_DOMAIN`) as `forms-flow-idm-{{.Release.Namespace}}.{{tpl (.Values.Domain) .}}` — i.e. it **already prepends the namespace itself**, so passing a namespace-prefixed `Domain` doubled it: `forms-flow-idm-a60371-dev.a60371-dev.apps.silver.devops.gov.bc.ca`. This silently broke every downstream component reading `forms-flow-ai`'s shared `KEYCLOAK_URL`/`KEYCLOAK_JWT_OIDC_*`/`FORMIO_DOMAIN` config (confirmed: caused `forms-flow-api` to crash-loop on a `CERTIFICATE_VERIFY_FAILED: Hostname mismatch` trying to reach Keycloak — the cert is for the real single-namespace host, not the doubled one). Grepped every use of `.Values.Domain` in this chart to confirm `${DOMAIN}` bare is correct everywhere, not just for this one key, before fixing. **Fixed here** (`Domain="${DOMAIN}"` above) — this corrects the shared configmap for every component that reads it, no per-downstream-chart patch needed. If re-running against an environment already installed with the old, wrong value: `helm upgrade` with the corrected value, then **restart every pod that already read the old config** (ConfigMap changes don't propagate to already-running pods' env vars) — `oc delete pod -l app.kubernetes.io/instance=<release>` per affected release.
+
+**⚠️ `FORMIO_ROOT_EMAIL`/`PASSWORD` must be the exact same value passed to Phase 3.4's `forms-flow-forms` install — another real bug found the same way.** This chart's `secrets.yaml` auto-generates `FORMIO_ROOT_EMAIL`/`FORMIO_ROOT_PASSWORD` in its own shared secret from `.Values["forms-flow-forms"].admin.email/password` — if left unset (as in the original draft), it silently falls back to the chart's placeholder defaults (`me@defineme.com`/`admin`), which do **not** match whatever real admin account Phase 3.4 actually creates in Form.io. Downstream components (`forms-flow-api` here, `forms-flow-data-layer` too) read *this* chart's secret to authenticate against Form.io — a mismatch causes silent login failures (`Generate formio token using formio login API` followed by `Expecting value: line 1 column 1` — a JSON-parse error from getting an HTML error page back instead of a token), not an install-time error. **Fixed by generating the credential once, here, and passing the identical value to both this install and Phase 3.4's** (updated below) — don't let the two independently generate their own.
 
 **Mongo renamed to match Postgres's naming convention (2026-08-17)** — the original `formio731`/`formiouser731` (created before `DB_SUFFIX` changed from `731` to `_82`) has been dropped and recreated as database `formio_82` with a plain, unsuffixed user `formiouser`, per Phase 1.2 above — same "database tagged, user not" pattern as `bpmdb_82`/`bpmuser` etc. Sourced from the `formsflow-db-82` secret rather than hardcoded here, since Mongo's database naming doesn't mechanically follow `${DB_SUFFIX}` the way Postgres's does (fresh database each generation, not a suffix applied cleanly by string substitution) — reading it from the secret avoids the two ever silently drifting apart again.
 
@@ -550,8 +565,11 @@ oc rollout status dc/formio-mongodb-dev -n "$NS" --timeout=120s
 # Leave at replicas=1 from here on — do NOT scale back to 0 after this step, unlike Phase 1.2/admin tasks.
 ```
 
+**⚠️ Use the exact same `FORMIO_ROOT_EMAIL`/`PASSWORD` already generated and passed to Phase 3.1's `forms-flow-ai` install — do not generate a fresh one here.** See the matching warning in Phase 3.1: this chart's admin account and `forms-flow-ai`'s shared secret (which `forms-flow-api`/`forms-flow-data-layer` read to authenticate against Form.io) must agree, or those downstream components silently fail to log in. Source from the secret Phase 3.1 already created:
+
 ```bash
-FORMIO_ROOT_PASS=$(openssl rand -base64 20)
+FORMIO_ROOT_EMAIL=$(oc get secret formsflow-forms-admin-82 -n "$NS" -o jsonpath='{.data.FORMIO_ROOT_EMAIL}' | base64 -d)
+FORMIO_ROOT_PASS=$(oc get secret formsflow-forms-admin-82 -n "$NS" -o jsonpath='{.data.FORMIO_ROOT_PASSWORD}' | base64 -d)
 FORMIO_JWT_SECRET=$(openssl rand -hex 32)
 
 helm upgrade --install forms-flow-forms ./charts/forms-flow-forms \
@@ -559,15 +577,13 @@ helm upgrade --install forms-flow-forms ./charts/forms-flow-forms \
   --set ingress.hostname="forms-flow-forms-${NS}.${DOMAIN}" \
   --set ingress.tls=true \
   --set ingress.selfSigned=true \
-  --set admin.email="<team-email>" \
+  --set admin.email="$FORMIO_ROOT_EMAIL" \
   --set admin.password="$FORMIO_ROOT_PASS" \
   --set jwt.secret="$FORMIO_JWT_SECRET"
 
-# Persist durably immediately — same lesson as every other generated credential this pass.
-oc create secret generic formsflow-forms-admin-82 -n "$NS" \
-  --from-literal=FORMIO_ROOT_EMAIL="<team-email>" \
-  --from-literal=FORMIO_ROOT_PASSWORD="$FORMIO_ROOT_PASS" \
-  --from-literal=FORMIO_JWT_SECRET="$FORMIO_JWT_SECRET"
+# Add the JWT secret to the same durable secret Phase 3.1 already started.
+oc patch secret formsflow-forms-admin-82 -n "$NS" --type=merge -p \
+  "{\"stringData\":{\"FORMIO_JWT_SECRET\":\"${FORMIO_JWT_SECRET}\"}}"
 ```
 
 **No Mongo `--set` needed here — fixed 2026-08-17, was a real bug in the original draft.** `charts/forms-flow-forms/values.yaml` has **no `mongodb.uri` value path at all** (grepped the whole file for "mongo", zero matches) — the line that used to be here did nothing. This chart actually reads `NODE_CONFIG` via `secretKeyRef` from whatever secret `.Values.formsflow.secret` points at, which defaults to `forms-flow-ai` — the same central secret Phase 3.1 populates. As long as Phase 3.1's `mongodb.auth.*`/`mongodb.service.*` values are set correctly (see the warning box there), `NODE_CONFIG` already has the right Mongo connection string by the time this step runs, automatically, for this chart and anything else reading `formsflow.secret` (e.g. `forms-flow-data-layer`'s `FORMIO_DB_URI`). Verify explicitly in Phase 4 rather than assuming — this class of bug (wrong value, no install-time error) only shows up as a runtime connection failure. **Confirmed working live 2026-08-18** — pod logs show `Opening new connection to mongodb://formiouser:...@formio-mongodb-dev:27017/formio_82`, followed by a full template/role/admin bootstrap and `Serving the Form.io API Platform`.
@@ -586,16 +602,47 @@ Run this (with the right `$HOST` for that component) for **every remaining Ingre
 
 ### 3.5 forms-flow-api (webapi)
 
+**Status for `dev`: done, 2026-08-18.** Four real bugs found and fixed running this step — two turned out to be foundational bugs in `forms-flow-ai`'s shared config (documented back in Phase 3.1, since fixing them there benefits every downstream component reading that shared secret/configmap, not just this one), plus a chart-dependency gap and a cross-namespace image-pull gap specific to this step. Detail below; **the two Phase-3.1 fixes (`Domain` bare, `FORMIO_ROOT_EMAIL`/`PASSWORD` matching) must be in place before this step will work** — if running fresh, that's already handled by the corrected Phase 3.1 above; if resuming a partially-broken install, re-run Phase 3.1's `helm upgrade` with the fix first.
+
 Build locally per the Phase 3.1 pattern (`<component>` = `forms-flow-api`) — no registry key yet. Also an explicit candidate for actual customization ("Camunda/API may need customizations" — TBD, not yet decided), which a local build accommodates either way.
 
+**⚠️ This chart (like `forms-flow-forms`) needs its own `helm dependency build` — not just `forms-flow-ai`/`forms-flow-idm` as Phase 2 originally said.** Every remaining chart in this phase (`forms-flow-api`, `forms-flow-data-layer`, `forms-flow-documents-api`, `forms-flow-analytics`, `forms-flow-bpm`, `forms-flow-web`, `servebc-api`) declares its own `common`-chart (or, for `forms-flow-analytics`, `redis`/`postgresql`) Bitnami dependency and will fail with *"found in Chart.yaml, but missing in charts/ directory"* otherwise. Run once, for all of them, before starting Phase 3 rather than one at a time as each fails:
 ```bash
+for chart in forms-flow-forms forms-flow-api forms-flow-data-layer forms-flow-documents-api forms-flow-analytics forms-flow-bpm forms-flow-web servebc-api; do
+  helm dependency build "./charts/$chart"
+done
+```
+
+**⚠️ Cross-namespace image pull from `a60371-tools` fails by default — a real, two-part blocker, not covered by Phase 0's checks.** First symptom: `ImagePullBackOff` with `authentication required` pulling `image-registry.openshift-image-registry.svc:5000/a60371-tools/forms-flow-api:...` into `a60371-dev`. The obvious fix (`oc policy add-role-to-group system:image-puller system:serviceaccounts:a60371-dev -n a60371-tools`) **failed with a `Forbidden` error — this account doesn't have RBAC-admin rights on `a60371-tools`** to create that binding (a real, unresolved gap — a cluster/project admin would need to grant this properly for a clean, permanent fix). Confirmed the *old* v4.0.8 stack's pods (still running, e.g. `forms-flow-webapi-14-kk96l`) already pull cross-namespace successfully using the `default` service account's auto-generated `default-dockercfg-ng9fs` secret — so a working cross-namespace grant already exists, just not one this account can extend to *new* service accounts. **Workaround, needs no extra permissions (namespace-local only):**
+```bash
+# Link the already-working pull secret onto the new chart-created SA (name matches the release)
+oc secrets link forms-flow-api default-dockercfg-ng9fs --for=pull -n "$NS"
+```
+This alone wasn't enough, though — **this chart's `values.yaml` hardcodes `image.pullSecrets: [forms-flow-ai-auth]`** (intended for AOT's private registry via `forms-flow-ai`'s `imageCredentials.*`, which we've deliberately left unset — see Phase 3.1's note), and the pod spec's own `imagePullSecrets` list takes priority over whatever's linked to the SA, so the pull kept failing even after the link above. **Fix: override it explicitly** (added to the install command below) to point at the working secret instead:
+```bash
+--set "image.pullSecrets[0]=default-dockercfg-ng9fs"
+```
+**Both steps are needed for every remaining locally-built component below** (`forms-flow-data-layer`, `forms-flow-documents-api`, `forms-flow-bpm`, `forms-flow-web`, `servebc-api`) — the SA-link (substituting that component's own release name) and the `image.pullSecrets[0]` override, every time, until someone with the right access grants `system:image-puller` properly on `a60371-tools`.
+
+```bash
+oc secrets link forms-flow-api default-dockercfg-ng9fs --for=pull -n "$NS"
+
+# TLS — same pattern established in Phase 3.4, needed for every Ingress-based component from here on.
+HOST="forms-flow-api-${NS}.${DOMAIN}"
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+  -keyout /tmp/selfsigned.key -out /tmp/selfsigned.crt -subj "/CN=${HOST}"
+oc create secret tls "${HOST}-tls" -n "$NS" --cert=/tmp/selfsigned.crt --key=/tmp/selfsigned.key
+rm -f /tmp/selfsigned.key /tmp/selfsigned.crt
+
 helm upgrade --install forms-flow-api ./charts/forms-flow-api \
   --namespace "$NS" \
   --set image.registry=image-registry.openshift-image-registry.svc:5000 \
   --set image.repository="${TOOLS_NS}/forms-flow-api" \
   --set image.tag="${ENV}-v8.2.5" \
+  --set "image.pullSecrets[0]=default-dockercfg-ng9fs" \
   --set ingress.hostname="forms-flow-api-${NS}.${DOMAIN}" \
   --set ingress.tls=true \
+  --set ingress.selfSigned=true \
   --set ExternalDatabase.ExistingSecretName=formsflow-db-82 \
   --set ExternalDatabase.ExistingDatabaseHostKey=FORMSFLOW_API_HOSTNAME \
   --set ExternalDatabase.ExistingDatabaseNameKey=FORMSFLOW_API_DB_NAME \
@@ -605,6 +652,8 @@ helm upgrade --install forms-flow-api ./charts/forms-flow-api \
 ```
 
 **Revised 2026-08-17 — the original `database.host/port/dbName/username/password` values didn't do what the earlier draft assumed.** This chart has no `database.*` value path wired into its actual DB connection at all (there's a top-level `database:` key, but it feeds something else, not the `DATABASE_HOST`/`_PASSWORD`/etc. env vars — those come exclusively from the `ExternalDatabase.*` block shown above, either pointed at an external secret, as here, or left unset so the chart mints its own auto-managed secret). Using `ExternalDatabase.ExistingSecretName` explicitly, as above, is what actually wires this chart to the consolidated secret from Phase 1.3 — confirmed against `charts/forms-flow-api/templates/deployment.yaml`, not assumed. Port isn't set here — it's not in the consolidated secret (not sensitive), and the chart's own default (5432, via its own auto-created ConfigMap) applies unless overridden.
+
+**Confirmed working live 2026-08-18** — pod `2/2 Running`, no restarts, `curl -sk https://forms-flow-api-${NS}.${DOMAIN}/webapi/` → `HTTP 200`, clean gunicorn boot with no Keycloak/Form.io connection errors (both were broken by the Phase 3.1 bugs above until those were fixed and this pod was restarted to pick up the corrected shared config).
 
 ### 3.6 forms-flow-data-layer (EE scope addition — no new database, reuses forms-flow-api's secret)
 
