@@ -794,6 +794,8 @@ oc wait --namespace "$NS" --for=condition=available deployment/forms-flow-bpm --
 
 ### 3.10 servebc-api (custom API — this repo's `/api`)
 
+**Status for `dev`: done, 2026-08-24 — clean install, no new bugs.** Straightforward using the by-now-established checklist (collision check, cross-namespace pull-secret link+override — this chart's own `image.pullSecrets` defaults to empty since it's ours, not AOT's, so no broken-default workaround needed here, just the usual link+`--set`; TLS self-signed cert). Quota check: `2700m`/`4000m` before, `2800m`/`4000m` after — comfortable.
+
 Build the image via a real OpenShift BuildConfig first (the local deployment used a manual `docker build`, not viable on Silver):
 
 ```bash
@@ -807,20 +809,34 @@ oc tag "${TOOLS_NS}/servebc-api:latest" "${TOOLS_NS}/servebc-api:${ENV}-${SERVEB
 > Tag fixed to use `servebc-api`'s own git SHA (2026-08-17) — the original draft tagged this `v7.3.1-${ENV}`, coupling *this org's own, entirely separate* custom API's build tag to the formsflow.ai app version, which never made sense and would have silently broken the moment the target version changed (as it just did, OSS 7.3.1 → EE 8.2.5). `servebc-api` versions independently of whichever formsflow release it's deployed alongside.
 
 ```bash
+HOST="servebc-api-${NS}.${DOMAIN}"
+
+# TLS — established pattern since Phase 3.4.
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+  -keyout /tmp/selfsigned.key -out /tmp/selfsigned.crt -subj "/CN=${HOST}"
+oc create secret tls "${HOST}-tls" -n "$NS" --cert=/tmp/selfsigned.crt --key=/tmp/selfsigned.key
+rm -f /tmp/selfsigned.key /tmp/selfsigned.crt
+
 helm upgrade --install servebc-api ./charts/servebc-api \
   --namespace "$NS" \
   --set image.registry="image-registry.openshift-image-registry.svc:5000" \
   --set image.repository="${TOOLS_NS}/servebc-api" \
   --set image.tag="${ENV}-${SERVEBC_API_SHA}" \
   --set image.pullPolicy=Always \
-  --set ingress.hostname="servebc-api-${NS}.${DOMAIN}" \
+  --set "image.pullSecrets[0]=default-dockercfg-ng9fs" \
+  --set ingress.hostname="${HOST}" \
   --set ingress.tls=true \
+  --set ingress.selfSigned=true \
   --set database.initJob.enabled=false \
   --set formsflow.servebcConfigmap=forms-flow-servebc \
   --set formsflow.servebcSecret=forms-flow-servebc
+
+oc secrets link servebc-api default-dockercfg-ng9fs --for=pull -n "$NS"
 ```
 
 > `database.initJob.enabled=false` because Phase 1 already created `servebcdb` manually — leave the chart's own auto-creation Job off to avoid it trying (and likely failing on privilege grounds, since it expects the DB user itself to have `CREATEDB`) to redo that work.
+
+**Confirmed working live 2026-08-24** — pod `1/1 Running`, no restarts; logs show a clean boot (`Database connection OK!`, `Server started on port 3003`) and successful internal healthchecks; route shows `TERMINATION: edge/Redirect`; `curl -sk https://servebc-api-${NS}.${DOMAIN}/api/v1/healthcheck` → `HTTP 200` both internally and externally.
 
 ### 3.11 forms-flow-web (frontend) — BLOCKED, 2026-08-18, real architecture gap
 
