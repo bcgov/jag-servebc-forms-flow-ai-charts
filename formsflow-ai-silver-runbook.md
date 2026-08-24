@@ -838,9 +838,11 @@ oc secrets link servebc-api default-dockercfg-ng9fs --for=pull -n "$NS"
 
 **Confirmed working live 2026-08-24** — pod `1/1 Running`, no restarts; logs show a clean boot (`Database connection OK!`, `Server started on port 3003`) and successful internal healthchecks; route shows `TERMINATION: edge/Redirect`; `curl -sk https://servebc-api-${NS}.${DOMAIN}/api/v1/healthcheck` → `HTTP 200` both internally and externally.
 
-### 3.11 forms-flow-web (frontend) — BLOCKED, 2026-08-18, real architecture gap
+### 3.11 forms-flow-web + the full microfrontend suite (frontend) — RESOLVED, 2026-08-24, no AOT registry access needed after all
 
-**Status: paused, not installed.** The microfrontends question flagged in the header is now fully resolved — and the answer is worse than "unconfirmed": `forms-flow-web` built from our local EE checkout genuinely **cannot serve a working page on its own**, and the real fix needs something we don't have yet (AOT's private registry access). Full investigation below; picking this back up requires either that access or a decision to hand-build a workaround.
+**Status: done for `dev`.** The 2026-08-18 blocker below turned out to be based on an incomplete premise — after talking to the formsflow devs directly, the user confirmed AOT's own production `forms-flow-web` is served from **S3**, not a private Docker image, and that we should build the microfrontend suite ourselves from the forked source with our own CI, same as RSBC does. That reframing, plus one corrected misreading of `forms-flow-web-root-config`'s actual templating (below), fully unblocked this — **no AOT private registry access was ever actually required**. All 10 pieces (`forms-flow-web` + 8 microfrontend packages + `forms-flow-web-root-config`) are built and deployed as plain containers, no S3/AWS/CI needed for `dev`. Section below documents the original (partially wrong) investigation first, then the full resolution.
+
+**Historical investigation (2026-08-18) — mostly correct, one wrong conclusion:**
 
 **1. Resolved the microfrontends question — EE's real frontend is 9 components, not 1.** `forms-flow-web`'s own `public/index.html` is literally `<html></html>` — it's a **single-spa microfrontend fragment** (`main: single-spa-index.js`, registers as `@formsflow/formsflow-web`), meant to be loaded by an orchestrating **root-config** shell, not visited directly. `forms-flow-web-root-config` (present in the EE repo, no existing chart) is that shell — its layout registers **five more** microfrontends we don't have in the EE checkout at all: `@formsflow/nav` (mounted on every page), `@formsflow/admin`, `@formsflow/task`, `@formsflow/submissions`, `@formsflow/integration`.
 
@@ -854,9 +856,35 @@ oc secrets link servebc-api default-dockercfg-ng9fs --for=pull -n "$NS"
 
 **4. Tried pulling `docker.io/formsflow/forms-flow-web-ee:v7.0.0` directly (assuming it was public since no explicit pull secret appears in RSBC's config) — it isn't.** `ErrImagePull: requested access to the resource is denied`. RSBC's cluster must have AOT-provided registry credentials configured elsewhere (project-wide pull secret, not visible in their gitops repo) — this confirms the runbook's existing "AOT's private registry access key authorized but not yet obtained" blocker is real and directly applicable here, not just a historical caution.
 
-**5. Fell back to our own custom-built `forms-flow-web-ee:dev-v8.2.5` image (the original Phase 3.11 plan) — installs and runs cleanly, but serves nginx's stock placeholder page, not the app.** Confirmed via `oc exec` into the pod: `/usr/share/nginx/html/index.html` is dated `Apr 16 2025` (the base `nginx:1.27-alpine` image's own bake date) — never overwritten by our build, even though the real built JS bundle (`forms-flow-web.js`, 6.9MB, dated the same day we built it) sits right next to it. The Dockerfile's `COPY --from=build-stage .../build /usr/share/nginx/html` step is correct; the problem is upstream — the build's own output genuinely doesn't contain a real `index.html`, tracing back to the empty `public/index.html` template in point 1. **Not a fixable Dockerfile/nginx bug** — this version of the EE source is built as a pure microfrontend fragment, full stop.
+**5. Fell back to our own custom-built `forms-flow-web-ee:dev-v8.2.5` image — installs and runs cleanly, but serves nginx's stock placeholder page.** Confirmed via `oc exec`: `/usr/share/nginx/html/index.html` is dated `Apr 16 2025` (the base `nginx:1.27-alpine` image's own bake date), never overwritten, even though the real built JS bundle sits right next to it. **This diagnosis was correct for `forms-flow-web` itself** (it's genuinely just a fragment, no real page needed) **but the conclusion drawn from it — "AOT registry access is the only way forward" — was wrong**, because it was based on an incomplete picture of `forms-flow-web-root-config` (see below).
 
-**Decision (user's call): pause here, move to `servebc-api`, revisit once AOT's private registry access is actually obtained** (needed either for the working `forms-flow-web-ee:v7.0.0` image directly, or for whatever tenant-specific combined-image build process AOT/the registry access unlocks). The attempted install was uninstalled (`helm uninstall forms-flow-web`) since it only served a non-functional placeholder. Old command kept below for reference:
+Paused here 2026-08-18 at the user's call, picked back up 2026-08-24 after the user checked with AOT and reframed the problem (see the RESOLUTION below).
+
+---
+
+## RESOLUTION (2026-08-24)
+
+**Corrected premise: `forms-flow-web`'s empty `index.html` was never a blocker** — it doesn't need one. It's *only* ever loaded as a JS import by `forms-flow-web-root-config` (the real shell), never visited directly. The earlier investigation treated a non-functional standalone page as a dead end when it was actually expected, correct behavior for a microfrontend fragment.
+
+**Corrected finding: `forms-flow-web-root-config` genuinely can render a real, complete page from our existing EE checkout — the 2026-08-18 investigation checked the wrong file.** It found `public/index.html` empty and concluded the shell had the same problem as the fragment. It doesn't: `webpack.config.js`'s `HtmlWebpackPlugin` config explicitly sets `template: "src/index.ejs"` and excludes `public/index.html` from the copy step (`ignore: ["**/index.html"]`). `src/index.ejs` is a full, real HTML template — it's where the `systemjs-importmap` script tag lives, built via EJS interpolation of `process.env.MF_FORMSFLOW_*_URL` (`<%= process.env.MF_FORMSFLOW_NAV_URL %>` etc.) at webpack build time. This is genuinely usable; nothing needed replacing.
+
+**No S3/AWS/GitHub CI/CD needed for `dev`.** Considered replicating AOT/RSBC's real production pipeline (per the 2026-08-18 findings: individual microfrontends built via webpack, pushed to S3 under a `<package>@<version>/` key prefix, served through what's almost certainly a generic nginx reverse-proxy in front of that bucket — confirmed by AOT's own `forms-flow-web/scripts/index.js` S3-upload script using exactly this `component@version/filename` key pattern, and by RSBC's "combined image" being far too small, 200m/50m CPU, to plausibly bundle 6+ full webpack builds). That's AOT's chosen *production* automation, not a requirement — for `dev`, every one of these packages already has a working `Dockerfile`+`nginx.conf` that bakes the static build directly into a container (the same `oc new-build`/`oc start-build` pattern used for every other component this whole migration). No AWS credentials, S3 bucket, or CI/CD pipeline needed.
+
+**All 8 microfrontend packages built from the user's fork** (`~/Documents/ServeLegal/code/jag-servebc-forms-flow-ai-micro-front-ends`, forked from `AOT-Technologies/forms-flow-ai-micro-front-ends`) via the standard local-build pattern. All 8 already had CORS headers configured in their `nginx.conf` (`Access-Control-Allow-Origin: *`) — needed since `forms-flow-web-root-config` loads them cross-origin; no fixes needed there. Two real build bugs found and fixed, both missing-shared-file issues (this is a monorepo where individual packages reference sibling files by relative path, which doesn't exist when building from just one package's subdirectory as the Docker context):
+1. **`forms-flow-nav`/`forms-flow-review`/`forms-flow-submissions`/`forms-flow-components`** all have `webpack.config.js` doing `require("../webpack.formio")` — a shared config file at the monorepo root, not present in any single package's own directory. Fixed by staging a copy of `webpack.formio.js` into each affected package directory and adding `COPY webpack.formio.js /<package>/webpack.formio.js` to each Dockerfile (landing it one level above the app dir, matching the `../` require).
+2. **`forms-flow-nav`** additionally has `Sidebar.scss` doing `@import '../../../forms-flow-theme/scss/v8-scss/mixins'` — a sibling package's stylesheets, three directories up. Fixed the same way: staged a copy of `forms-flow-theme/scss/` into `forms-flow-nav/forms-flow-theme-scss/`, added `COPY forms-flow-theme-scss/ /forms-flow-nav/forms-flow-theme/scss/` to its Dockerfile.
+
+These fixes are currently **uncommitted, local-only changes to the user's fork** (`git status` shows the 4 modified Dockerfiles + staged shared-file copies as untracked) — worth committing if this fork is going to be maintained/rebuilt from again, not yet done as of this writing; flagged for the user to decide.
+
+Each of the 8 was then deployed as a plain `Deployment`+`Service`+`Route` (no Helm chart exists for any of them, and writing one wasn't worth it for 8 near-identical tiny static-file containers) — same collision-check/TLS-cert/cross-namespace-pull-secret checklist as every other component, at `20m`/`100m` CPU request/limit each (comfortably small; confirmed real built JS files like `forms-flow-nav.js` reachable at each one's route, not placeholders).
+
+**`forms-flow-web` (the fragment) redeployed via its existing chart**, same as the 2026-08-18 attempt (custom-built `forms-flow-web-ee:dev-v8.2.5` image) — the non-functional-standalone-page finding from before is *expected*, not a bug; what matters is that `forms-flow-web.js` is reachable at its route (confirmed, `HTTP 200`), which is all `forms-flow-web-root-config` actually needs.
+
+**`forms-flow-web-root-config` built and deployed, with two more real bugs found and fixed:**
+1. **Permission denied writing `config.js` at container start.** `env.sh` (which regenerates `config.js` from `config.template.js` via `envsubst`) does `rm -rf ./config.js; touch ./config.js` inside `/usr/share/nginx/html/config`, but OpenShift's restricted SCC runs the container as a random non-root UID that doesn't own that directory. Fixed in the Dockerfile: `chmod -R g+rwX` + `chgrp -R 0` on that directory (the standard OpenShift arbitrary-UID pattern — containers always run in group `0` regardless of the assigned UID, so group-writable + group-0-owned works for any UID). Also had to override the container's `command` to actually invoke `env.sh` before `nginx` starts — the Dockerfile's active `CMD` skips it entirely (`# CMD [...env.sh && nginx...]` is present but commented out, the *disabled* line is the one that's actually correct).
+2. **`oc start-build --build-arg` silently does nothing for binary builds.** The Dockerfile takes `MF_FORMSFLOW_*_URL` as build `ARG`s, consumed by `src/index.ejs`'s EJS interpolation at build time. Passing `--build-arg=KEY=VALUE` to `oc start-build --from-dir=...` produces a real warning (easy to miss buried in build log output — *"WARNING: Specifying build arguments with binary builds is not supported"*) and the resulting `Build` object's `dockerStrategy.buildArgs` is empty — every import-map URL came out blank. **Fixed via a different existing mechanism**: `webpack.config.js` already does `require("dotenv").config({ path: "./.env" })`, and the Dockerfile's `COPY . /forms-flow-web-root-config/app/` picks up any `.env` file placed in the build context. Provided one with all 8 `MF_FORMSFLOW_*_URL` values + `NODE_ENV`. **Also had to remove the Dockerfile's `ARG X` / `ENV X ${X}` lines entirely** (not just stop passing `--build-arg`) — `dotenv` only sets variables that aren't already present in `process.env`, and Docker's `ENV X ${X}` with an empty/unset `ARG` sets `X` to an actual empty string, which silently blocks `.env` from ever taking effect for that key.
+
+**Confirmed working end-to-end 2026-08-24**: `forms-flow-web-root-config` pod `1/1 Running`; page loads (`HTTP 200`); the rendered `<script type="systemjs-importmap">` contains all 8 correct, real URLs (`@formsflow/nav` → `forms-flow-nav-${NS}.${DOMAIN}/forms-flow-nav.js`, `@formsflow/task` → the `forms-flow-review` deployment confirming the `task`↔`review` naming split found in the layout, etc.) plus its own `@formsflow/root-config` self-reference; `formsflow-root-config.js` itself reachable. **Not yet verified: actual browser-based behavior** (module loading across origins, Keycloak auth flow, real page rendering/navigation) — everything above confirms the static wiring is correct, not that a user can actually log in and use the app. Do a real browser smoke test before considering this fully done; that's a natural fit for Phase 4's whole-flow verification.
 
 ```bash
 helm upgrade --install forms-flow-web ./charts/forms-flow-web \
@@ -878,6 +906,57 @@ helm upgrade --install forms-flow-web ./charts/forms-flow-web \
   --set-string web.enable_applications_module=true
 ```
 Note this chart's `web.enable_*_module`/`IsEnterPrise` values are **booleans in Helm's type system but the template runs `tpl` on them expecting strings** — pass via `--set-string`, not `--set`, or `helm` errors with `wrong type for value; expected string; got bool`.
+
+**Building and deploying the 8 microfrontend packages** (`<pkg>` = each of `forms-flow-admin`/`forms-flow-nav`/`forms-flow-review`/`forms-flow-submissions`/`forms-flow-integration`/`forms-flow-components`/`forms-flow-service`/`forms-flow-theme`):
+```bash
+# One-time fixes before building nav/review/submissions/components (see finding #1/#2 above) —
+# already applied to the local fork as of 2026-08-24, shown here for reference/re-cloning:
+cd ~/Documents/ServeLegal/code/jag-servebc-forms-flow-ai-micro-front-ends
+for pkg in forms-flow-nav forms-flow-review forms-flow-submissions forms-flow-components; do
+  cp webpack.formio.js "$pkg/webpack.formio.js"
+done
+cp -r forms-flow-theme/scss forms-flow-nav/forms-flow-theme-scss
+# ...then add the corresponding COPY lines to each of those 4 Dockerfiles (see finding #1/#2).
+
+# Build + deploy each package:
+HOST="<pkg>-${NS}.${DOMAIN}"
+oc new-build --name=<pkg> --binary --strategy=docker -n "$TOOLS_NS" 2>/dev/null || true
+oc start-build <pkg> --from-dir="~/Documents/ServeLegal/code/jag-servebc-forms-flow-ai-micro-front-ends/<pkg>" -n "$TOOLS_NS" --follow
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 -keyout /tmp/tls.key -out /tmp/tls.crt -subj "/CN=${HOST}"
+oc create secret tls "${HOST}-tls" -n "$NS" --cert=/tmp/tls.crt --key=/tmp/tls.key
+# Then a plain Deployment (image from a60371-tools, imagePullSecrets: default-dockercfg-ng9fs,
+# containerPort 8080, requests 20m/32Mi, limits 100m/128Mi) + Service (port 8080) + Route
+# (edge termination, insecureEdgeTerminationPolicy: Redirect) per package — no Helm chart,
+# plain `oc apply -f -` manifests. See git history for the exact YAML used.
+```
+
+**Building and deploying `forms-flow-web-root-config`:**
+```bash
+# .env file with the real URLs (see finding #2 above for why this replaces --build-arg):
+cat > ~/Documents/ServeLegal/code/forms-flow-ai-ee/forms-flow-web-root-config/.env <<EOF
+NODE_ENV=production
+MF_FORMSFLOW_WEB_URL=https://forms-flow-web-${NS}.${DOMAIN}/forms-flow-web.js
+MF_FORMSFLOW_NAV_URL=https://forms-flow-nav-${NS}.${DOMAIN}/forms-flow-nav.js
+MF_FORMSFLOW_ADMIN_URL=https://forms-flow-admin-${NS}.${DOMAIN}/forms-flow-admin.js
+MF_FORMSFLOW_REVIEW_URL=https://forms-flow-review-${NS}.${DOMAIN}/forms-flow-review.js
+MF_FORMSFLOW_SUBMISSIONS_URL=https://forms-flow-submissions-${NS}.${DOMAIN}/forms-flow-submissions.js
+MF_FORMSFLOW_SERVICE_URL=https://forms-flow-service-${NS}.${DOMAIN}/forms-flow-service.js
+MF_FORMSFLOW_INTEGRATION_URL=https://forms-flow-integration-${NS}.${DOMAIN}/forms-flow-integration.js
+MF_FORMSFLOW_COMPONENTS_URL=https://forms-flow-components-${NS}.${DOMAIN}/forms-flow-components.js
+EOF
+
+oc new-build --name=forms-flow-web-root-config --binary --strategy=docker -n "$TOOLS_NS" 2>/dev/null || true
+oc start-build forms-flow-web-root-config \
+  --from-dir=~/Documents/ServeLegal/code/forms-flow-ai-ee/forms-flow-web-root-config \
+  -n "$TOOLS_NS" --follow
+# NOTE: do NOT pass --build-arg here, it silently does nothing for binary builds (see finding #2).
+
+# Deployment needs a command override to actually run env.sh (see finding #1), plus the
+# forms-flow-web-root-config's own runtime REACT_APP_*/KEYCLOAK_* config (same shape as
+# forms-flow-web's own chart values) as container env vars:
+#   command: ["/bin/bash", "-c", "/usr/share/nginx/html/config/env.sh && nginx -g 'daemon off;'"]
+# Then Service (port 8080) + Route (edge termination), same pattern as the 8 packages above.
+```
 
 ---
 
@@ -906,9 +985,19 @@ curl -sk -o /dev/null -w "forms-flow-bpm -> HTTP %{http_code}\n" "https://forms-
 # servebc-api
 curl -sk -o /dev/null -w "servebc-api -> HTTP %{http_code}\n" "https://servebc-api-${NS}.${DOMAIN}/api/v1/healthcheck"
 
-# web
-curl -sk -o /dev/null -w "forms-flow-web -> HTTP %{http_code}\n" "https://forms-flow-web-${NS}.${DOMAIN}/"
+# web (the fragment itself is never visited directly — check its JS is reachable, not "/")
+curl -sk -o /dev/null -w "forms-flow-web.js -> HTTP %{http_code}\n" "https://forms-flow-web-${NS}.${DOMAIN}/forms-flow-web.js"
+
+# the real entry point users actually visit
+curl -sk -o /dev/null -w "forms-flow-web-root-config -> HTTP %{http_code}\n" "https://forms-flow-web-root-config-${NS}.${DOMAIN}/"
+
+# the 8 microfrontend pieces (check pod readiness + real JS reachable, not just route 200)
+for pkg in forms-flow-admin forms-flow-nav forms-flow-review forms-flow-submissions forms-flow-integration forms-flow-components forms-flow-service forms-flow-theme; do
+  curl -sk -o /dev/null -w "$pkg -> HTTP %{http_code}\n" "https://${pkg}-${NS}.${DOMAIN}/${pkg}.js"
+done
 ```
+
+**Do a real browser smoke test of `https://forms-flow-web-root-config-${NS}.${DOMAIN}/` here, not just curl checks** — the whole-flow smoke test further down (login, form submission, task list) is the actual verification that the microfrontend suite works, not just that each piece's static files are reachable.
 
 **Whole-flow smoke test (manual, in a browser):** log in as `formsflow-client`, submit a form, confirm a Camunda process instance + webapi application record is created; log in as `formsflow-reviewer`, confirm the task appears (expect a manual-refresh delay, not real-time — known gap, see Non-goals); confirm a real IDIR-federated staff login works via the broker. Explicitly test and record the actual behavior of the public NCQ form route — expected broken per the Non-goals section; don't assume, verify and document what actually happens.
 
@@ -930,6 +1019,13 @@ for chart in forms-flow-web servebc-api forms-flow-bpm forms-flow-analytics form
 done
 ```
 `helm uninstall` does not delete PVCs — clean up explicitly (`oc get pvc -n "$NS"`) once you're certain you don't need them.
+
+**`forms-flow-web-root-config` and the 8 microfrontend packages (Phase 3.11) are plain `oc apply`'d manifests, not Helm releases — the loop above doesn't touch them.** Tear down separately if needed:
+```bash
+for pkg in forms-flow-web-root-config forms-flow-admin forms-flow-nav forms-flow-review forms-flow-submissions forms-flow-integration forms-flow-components forms-flow-service forms-flow-theme; do
+  oc delete deployment,service,route "$pkg" -n "$NS"
+done
+```
 
 **Do not drop the old v4.0.8 databases** (`bpmdb`, `webapidb`, `keycloakdb`, `analyticsdb`, the old Mongo formio DB — no `_${DB_SUFFIX}` suffix) **or delete the old DeploymentConfigs** until this environment's go/no-go checklist above has passed and an agreed soak period has elapsed. The exported DC/route/service YAML from Phase 0 plus the still-intact old databases are your rollback path back to v4.0.8 if EE 8.2.5 doesn't work out.
 
