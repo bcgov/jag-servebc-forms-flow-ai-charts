@@ -2,3 +2,10 @@
 *.lock
 *.swp
 
+# Per-environment Helm values files, kept local-only — this repo is a public bcgov fork
+# (not the private bcgov-c), so real secrets (DB passwords, client secrets, S3 keys, etc.)
+# can't be committed here. The README explaining the convention IS committed; only the
+# actual per-env value files (which contain secrets) are excluded.
+values-local/*/
+!values-local/README.md
+
