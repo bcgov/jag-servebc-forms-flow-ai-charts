@@ -15,6 +15,7 @@ data:
       server {
         client_max_body_size {{ .Values.maxSizePayload }};
         listen {{ .Values.ingress.servicePort }};
+        absolute_redirect off;
         location /formio/ {
           rewrite ^/formio/(.*)$ /$1 break;
           proxy_set_header Host $http_host;
